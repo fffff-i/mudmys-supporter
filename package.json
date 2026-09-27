@@ -1,0 +1,56 @@
+{
+  "name": "makua-mystery-notebook",
+  "version": "0.2.0",
+  "private": true,
+  "description": "シナリオ資料を根拠に状況と次の確認行動を整理するデスクトップノート",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && electron .\"",
+    "build": "tsc --noEmit && vite build",
+    "start": "electron .",
+    "test": "node --test",
+    "package:portable": "npm run build && electron-builder --win portable"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.9",
+    "openai": "^7.23.0",
+    "pdfjs-dist": "^6.3.289",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.13",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "concurrently": "^9.2.1",
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.1",
+    "wait-on": "^8.0.4"
+  },
+  "build": {
+    "appId": "jp.makua.mysterynotebook",
+    "productName": "幕間ノート",
+    "directories": {
+      "output": "release-v0.2.0"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "shared/**",
+      "node_modules/**",
+      "package.json"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/@napi-rs/canvas/**"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "artifactName": "Makua-Notebook-${version}-portable.${ext}"
+    }
+  }
+}
