@@ -27,7 +27,7 @@ npm test
 npm run build
 ```
 
-Windows向けportable版を生成するには `npm run package:portable` を実行します。生成物は `release-v0.2.0/` に出力されます。このフォルダーは公開リポジトリには含めません。
+Windows向けportable版を生成するには `npm run package:portable` を実行します。生成物は `release-v0.2.1/` に出力されます。このフォルダーは公開リポジトリには含めません。
 
 ## AI接続
 
