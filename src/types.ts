@@ -115,9 +115,12 @@ export type AnalysisGrounding = {
   contextHistoryActionIds?: string[];
 };
 
+export type AnalysisResult = { status: string; message?: string; scenario?: Scenario; usage?: Analysis['usage']; textCharacters?: number; attachmentBytes?: number };
+
 export type Analysis = {
   revision: number;
   inputRevision: number;
+  settingsKey?: string;
   updatedAt: string;
   provider: string;
   overview: string;
@@ -171,6 +174,7 @@ export type Scenario = {
 };
 
 export type AppSettings = {
+  settingsVersion?: number;
   provider: 'none' | 'openai' | 'ollama' | 'codex';
   model: string;
   effort: string;
@@ -223,7 +227,7 @@ declare global {
       discardAction: (value: Record<string, unknown>) => Promise<Scenario>;
       updateActionNotes: (value: Record<string, unknown>) => Promise<Scenario>;
       restoreAction: (value: Record<string, unknown>) => Promise<Scenario>;
-      analyze: (value: Record<string, unknown>) => Promise<{ status: string; message?: string; scenario?: Scenario; usage?: Analysis['usage']; textCharacters?: number; attachmentBytes?: number }>;
+      analyze: (value: Record<string, unknown>) => Promise<AnalysisResult>;
       cancelAnalysis: (value: Record<string, unknown>) => Promise<{ canceled: boolean }>;
     };
   }

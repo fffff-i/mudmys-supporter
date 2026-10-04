@@ -515,3 +515,5 @@ button:disabled { cursor: default; opacity: .62; }
 .history-note-editor label { display: grid; gap: 5px; margin: 8px 0; }
 .history-note-editor textarea { width: 100%; min-width: 0; padding: 7px; border: 1px solid #e4e5dc; border-radius: 4px; resize: vertical; font: inherit; color: #445c4f; }
 .history-note-editor .button { min-height: 30px; font-size: 10px; }
+
+.analysis-status { margin-bottom: 16px; font-size: 12px; line-height: 1.5; }

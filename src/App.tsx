@@ -1,5 +1,6 @@
 import { FormEvent, ClipboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createSelectionGuard } from '../shared/selectionGuard.mjs';
+import { createAnalysisUpdater, type AnalysisUpdateState } from '../shared/analysisUpdater.mjs';
 import { createScenarioDrafts, type ProfileDraft, type TextDraft, type DraftCandidate, type EvidenceEdit } from '../shared/scenarioDrafts.mjs';
 import { evidenceBody, evidenceUsage } from '../shared/evidence.mjs';
 import { createSourceReader, type SourceViewState } from '../shared/sourceReader.mjs';
@@ -77,8 +78,7 @@ function App() {
   const [codexStatus, setCodexStatus] = useState<CodexConnectionStatus | null>(null);
   const [page, setPage] = useState<Page>('overview');
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [autoBusy, setAutoBusy] = useState(false);
+  const [analysisState, setAnalysisState] = useState<AnalysisUpdateState>({ id: null, phase: 'idle', pending: false, dirty: false });
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
@@ -94,7 +94,35 @@ function App() {
   const [, setDraftVersion] = useState(0);
   const draft = scenario && !deletedScenarioIds.current.has(scenario.id) ? scenarioDrafts.current.read(scenario) : null;
   const refreshDrafts = () => setDraftVersion((current) => current + 1);
-  const activeAnalysisRef = useRef<{ id: string; expectedRevision: number; codex: boolean } | null>(null);
+  const analysisUpdater = useRef<ReturnType<typeof createAnalysisUpdater> | null>(null);
+  if (!analysisUpdater.current) analysisUpdater.current = createAnalysisUpdater({
+    readScenario: (id) => window.makua.getScenario(id),
+    readSettings: () => window.makua.getSettings(),
+    analyze: (request) => window.makua.analyze(request),
+    cancel: (request) => window.makua.cancelAnalysis(request),
+    onState: setAnalysisState,
+    onScenario: (next, token) => { mergeScenario(next); applyScenario(next, token); },
+    onResult: (result, token) => {
+      if (!selectionGuard.current.isCurrent(token)) return;
+      if (result.status === 'ok') {
+        const usage = result.usage;
+        const usageLabel = usage?.input_tokens != null ? ' 入力 ' + usage.input_tokens.toLocaleString() + ' / 出力 ' + (usage.output_tokens || 0).toLocaleString() + ' tokens。' : '';
+        setError('');
+        setNotice('解析を更新しました。' + usageLabel);
+      } else if (result.status === 'error') {
+        setError((result.message || '解析に失敗しました。') + ' 資料と前回の結果は保持されています。');
+        setNotice('');
+      } else {
+        setNotice(result.status === 'stale' ? '資料は保存済みです。未反映の情報があります。' : result.message || '資料は保存済みです。');
+      }
+    }
+  });
+  const busy = analysisState.id === scenario?.id && analysisState.phase !== 'idle';
+  const receiveSettings = (next: AppSettings) => {
+    analysisUpdater.current!.setSettings(next);
+    setSettings(next);
+  };
+
 
   const activeActions = scenario?.analysis?.actions.filter((action) => action.status === 'active') || [];
   const historyActions = scenario?.actionHistory || [];
@@ -114,6 +142,7 @@ function App() {
     if (displayedScenario.current?.id !== next.id) sourceReader.current.close();
     displayedScenario.current = next;
     setScenario(next);
+    analysisUpdater.current!.observe(next);
     return true;
   };
 
@@ -131,8 +160,9 @@ function App() {
     Promise.all([window.makua.listScenarios(), window.makua.getSettings()]).then(async ([list, preferences]) => {
       if (!mounted) return;
       setScenarios(list);
-      setSettings(preferences);
+      receiveSettings(preferences);
       const token = selectionGuard.current.select(list[0]?.id || null);
+      analysisUpdater.current!.select(token);
       if (list.length) {
         const loaded = await window.makua.getScenario(list[0].id);
         if (mounted && selectionGuard.current.isCurrent(token)) applyScenario(loaded, token);
@@ -156,7 +186,7 @@ function App() {
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [Boolean(sourceView)]);
 
-  useEffect(() => () => sourceReader.current.close(), []);
+  useEffect(() => () => { sourceReader.current.close(); analysisUpdater.current!.dispose(); }, []);
 
   const reportError = (reason: unknown, token?: ReturnType<ReturnType<typeof createSelectionGuard>['capture']>) => {
     if (token && !selectionGuard.current.isCurrent(token)) return;
@@ -165,13 +195,14 @@ function App() {
     setNotice('');
   };
 
-  const updateScenario = async (next: Scenario, message: string, runAutomatic = true, token = selectionGuard.current.capture()) => {
+  const updateScenario = async (next: Scenario, message: string, inputChanged = true, token = selectionGuard.current.capture()) => {
+    if (deletedScenarioIds.current.has(next.id)) return;
+    if (inputChanged) analysisUpdater.current!.changed(next); else analysisUpdater.current!.observe(next);
     mergeScenario(next);
     if (!selectionGuard.current.isCurrent(token) || token.id !== next.id) return;
     if (!applyScenario(next, token)) return;
     setError('');
     setNotice(message);
-    if (runAutomatic && settings.autoUpdate && aiConnected) await runAnalysis(next, true, token);
   };
 
   const updateDraftScenario = async (saved: Scenario, message: string, token: ReturnType<ReturnType<typeof createSelectionGuard>['capture']>) => {
@@ -180,6 +211,7 @@ function App() {
       await updateScenario(saved, message, true, token);
       return;
     }
+    analysisUpdater.current!.changed(saved);
     mergeScenario(saved);
     const currentToken = selectionGuard.current.capture();
     if (currentToken.id !== saved.id) return;
@@ -187,7 +219,7 @@ function App() {
     // rather than applying the response belonging to the earlier selection.
     try {
       const loaded = await window.makua.getScenario(saved.id);
-      await updateScenario(loaded, message, true, currentToken);
+      await updateScenario(loaded, message, false, currentToken);
     } catch (reason) { reportError(reason, currentToken); }
   };
 
@@ -203,56 +235,15 @@ function App() {
     refreshDrafts();
   };
 
-  const runAnalysis = async (target = scenario, automatic = false, token = selectionGuard.current.capture()) => {
-    if (!target) return;
-    if (token.id !== target.id || !selectionGuard.current.isCurrent(token)) return;
-    if (automatic) setAutoBusy(true); else setBusy(true);
-    const activeRun = { id: target.id, expectedRevision: target.revision, codex: settings.provider === 'codex' };
-    activeAnalysisRef.current = activeRun;
-    setNotice(automatic ? '追加資料から状況と優先行動を更新しています…' : '保存済み資料だけを根拠に解析しています…');
-    setError('');
-    try {
-      const result = await window.makua.analyze({ id: target.id, expectedRevision: target.revision });
-      if (result.status === 'ok' && result.scenario) {
-        mergeScenario(result.scenario);
-        if (!applyScenario(result.scenario, token)) return;
-        const usage = result.usage;
-        const usageLabel = usage?.input_tokens != null ? ' 入力 ' + usage.input_tokens.toLocaleString() + ' / 出力 ' + (usage.output_tokens || 0).toLocaleString() + ' tokens。' : '';
-        setNotice((automatic ? '自動更新しました。' : '解析を更新しました。') + usageLabel);
-      } else if (result.status === 'unconfigured') {
-        if (!selectionGuard.current.isCurrent(token)) return;
-        setNotice(result.message || 'AI未接続です。資料は保存済みです。');
-      } else if (result.status === 'stale') {
-        if (!selectionGuard.current.isCurrent(token)) return;
-        setNotice(result.message || '新しい変更があるため、古い解析結果は保存しませんでした。');
-      } else if (result.status === 'cancelled') {
-        if (!selectionGuard.current.isCurrent(token)) return;
-        setNotice(result.message || '解析をキャンセルしました。前回結果は保持されています。');
-      } else {
-        if (!selectionGuard.current.isCurrent(token)) return;
-        setError((result.message || '解析に失敗しました。') + ' 前回の有効な結果は保持されています。');
-        setNotice('');
-      }
-    } catch (reason) {
-      reportError(reason, token);
-    } finally {
-      if (activeAnalysisRef.current === activeRun) activeAnalysisRef.current = null;
-      if (selectionGuard.current.isCurrent(token)) {
-        setBusy(false);
-        setAutoBusy(false);
-      }
-    }
+  const runAnalysis = () => {
+    const target = displayedScenario.current;
+    if (target && selectionGuard.current.capture().id === target.id) analysisUpdater.current!.request(target.id);
   };
 
   const openScenario = async (id: string) => {
     sourceReader.current.close();
     const token = selectionGuard.current.select(id);
-    const activeRun = activeAnalysisRef.current;
-    if (activeRun?.codex && activeRun.id !== id) {
-      window.makua.cancelAnalysis({ id: activeRun.id, expectedRevision: activeRun.expectedRevision }).catch(() => {});
-    }
-    setBusy(false);
-    setAutoBusy(false);
+    analysisUpdater.current!.select(token);
     const cached = scenarios.find((item) => item.id === id);
     if (cached) applyScenario(cached, token);
     else { displayedScenario.current = null; setScenario(null); }
@@ -269,9 +260,9 @@ function App() {
   };
 
   const cancelCurrentAnalysis = () => {
-    const activeRun = activeAnalysisRef.current;
-    if (!activeRun?.codex) return;
-    window.makua.cancelAnalysis({ id: activeRun.id, expectedRevision: activeRun.expectedRevision }).catch(reportError);
+    const id = selectionGuard.current.capture().id;
+    if (id) analysisUpdater.current!.cancel(id);
+    setNotice('更新を中止しました。資料と前回結果は保持しています。');
   };
 
   const receiveCodexStatus = (status: CodexConnectionStatus | null) => setCodexStatus(status);
@@ -286,8 +277,7 @@ function App() {
       setNewTitle('');
       setCreateOpen(false);
       const token = selectionGuard.current.select(created.id);
-      setBusy(false);
-      setAutoBusy(false);
+      analysisUpdater.current!.select(token);
       applyScenario(created, token);
       setPage('overview');
       setNotice('シナリオを作成しました。概要と役の目的を記録できます。');
@@ -301,8 +291,7 @@ function App() {
       mergeScenario(created);
       if (!selectionGuard.current.isCurrent(requestedFrom)) return;
       const token = selectionGuard.current.select(created.id);
-      setBusy(false);
-      setAutoBusy(false);
+      analysisUpdater.current!.select(token);
       applyScenario(created, token);
       setPage('overview');
       setNotice('架空のデモ資料を追加しました。AI解析ではなく画面例です。');
@@ -317,7 +306,8 @@ function App() {
     if (!request) return;
     refreshDrafts();
     try {
-      const saved = await window.makua.saveProfile({ id: request.id, expectedRevision: scenario.revision, ...request.value });
+      const saved = await window.makua.saveProfile({ id: request.id, expectedRevision: scenario.revision,
+        expectedProfile: { title: scenario.title, synopsis: scenario.synopsis, role: scenario.roleProfile?.role || '', goal: scenario.roleProfile?.goal || '', secret: scenario.roleProfile?.secret || '' }, ...request.value });
       scenarioDrafts.current.finishProfileSave(request, saved);
       refreshDrafts();
       await updateDraftScenario(saved, 'シナリオ情報を保存しました。', token);
@@ -450,8 +440,9 @@ function App() {
     setPendingActionKeys([...actionWrites.current]);
     try {
       const saved = await save();
-      if (selectionGuard.current.isCurrent(token)) await updateScenario(saved, message, false, token);
+      if (selectionGuard.current.isCurrent(token)) await updateScenario(saved, message, true, token);
       else {
+        analysisUpdater.current!.changed(saved);
         mergeScenario(saved);
         const currentToken = selectionGuard.current.capture();
         if (currentToken.id === saved.id) {
@@ -508,6 +499,7 @@ function App() {
       const answer = await window.makua.deleteScenario(targetId);
       if (!answer.deleted) return;
       deletedScenarioIds.current.add(targetId);
+      analysisUpdater.current!.remove(targetId);
       scenarioDrafts.current.delete(targetId);
       const remaining = (await window.makua.listScenarios());
       setScenarios((current) => remaining.map((fresh) => {
@@ -517,8 +509,7 @@ function App() {
       if (!selectionGuard.current.isCurrent(token)) return;
       const nextId = remaining.find((item) => !deletedScenarioIds.current.has(item.id))?.id || null;
       const nextToken = selectionGuard.current.select(nextId);
-      setBusy(false);
-      setAutoBusy(false);
+      analysisUpdater.current!.select(nextToken);
       if (nextId) {
         const loaded = await window.makua.getScenario(nextId);
         if (!selectionGuard.current.isCurrent(nextToken)) return;
@@ -590,20 +581,21 @@ function App() {
           <div><div className="eyebrow">{scenario ? 'CASE NOTE / ' + (scenario.analysis?.provider?.startsWith('架空デモ') ? 'SAMPLE' : 'PLAY SESSION') : 'PRIVATE WORKSPACE'}</div><div className="topbar-title">{page === 'settings' ? '接続と保存の設定' : scenario?.title || '推理の余白を、ひとつずつ。'}</div></div>
           <div className="topbar-actions">
             <div className={'connection-pill ' + (aiConnected ? 'connected' : '')}><span className="status-light"/>{aiConnected ? settings.provider === 'openai' ? 'OpenAI API' : settings.provider === 'codex' ? 'Codex Plus枠' : 'Ollama ローカル' : 'AI未接続'}</div>
-            {scenario && page !== 'settings' && (busy || autoBusy) && activeAnalysisRef.current?.codex
+            {scenario && page !== 'settings' && busy
               ? <button className="button button-light" onClick={cancelCurrentAnalysis}>解析を中止</button>
-              : scenario && page !== 'settings' && <button className="button button-ink" onClick={() => runAnalysis()} disabled={busy || autoBusy}><span className="sparkle">✳</span>{busy ? '解析中…' : '状況を更新'}</button>}
+              : scenario && page !== 'settings' && <button className="button button-ink" onClick={() => runAnalysis()} disabled={busy}><span className="sparkle">✳</span>{busy ? '更新中…' : '状況を更新'}</button>}
           </div>
         </header>
 
         <main className={'main-content' + (page === 'settings' ? ' main-content-settings' : '')}>
+          {scenario && page !== 'settings' && analysisState.id === scenario.id && <AnalysisStatus state={analysisState}/>}
           {(notice || error) && <div className={'toast ' + (error ? 'toast-error' : '')}><span>{error ? '!' : '✓'}</span><div>{error || notice}</div><button onClick={() => { setNotice(''); setError(''); }} aria-label="閉じる">×</button></div>}
           {!scenario && page !== 'settings' && <EmptyState onNew={() => setCreateOpen(true)} onDemo={createDemo} />}
-          {scenario && page === 'overview' && <Overview scenario={scenario} settings={settings} busy={busy || autoBusy} activeActions={activeActions} onEdit={() => setPage('evidence')} onPlans={() => setPage('plans')} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
+          {scenario && page === 'overview' && <Overview scenario={scenario} settings={settings} busy={busy} activeActions={activeActions} onEdit={() => setPage('evidence')} onPlans={() => setPage('plans')} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
           {scenario && draft && page === 'evidence' && <EvidencePage scenario={scenario} title={draft.text.title} setTitle={(title) => editTextDraft({ title })} draft={draft.text.text} setDraft={(text) => editTextDraft({ text })} visibility={draft.text.visibility} setVisibility={(visibility) => editTextDraft({ visibility })} textSaving={draft.textSaving} profileSaving={draft.profileSaving} onAddText={addText} onAddFiles={addFiles} candidates={draft.candidates} onRemoveCandidate={removeCandidate} onPaste={handlePasteImage} editFor={(item) => scenarioDrafts.current.readEvidence(scenario, item)} onEvidenceEdit={editEvidenceDraft} onEvidenceSave={saveEvidence} onEvidenceEnabled={setEvidenceEnabled} onVisibility={setEvidenceVisibility} selected={selectedEvidence} onSelect={setSelectedEvidence} preview={preview} onPreview={previewImage} onSource={goToEvidence} onProfileSave={saveProfile} profile={draft.profile} setProfile={editProfileDraft} totalChars={usage.textCharacters} totalBytes={usage.attachmentBytes} retainedBytes={usage.retainedBytes} settings={settings} />}
-          {scenario && page === 'plans' && <PlansPage scenario={scenario} actions={activeActions} settings={settings} busy={busy || autoBusy} onAnalyze={() => runAnalysis()} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
+          {scenario && page === 'plans' && <PlansPage scenario={scenario} actions={activeActions} settings={settings} busy={busy} onAnalyze={() => runAnalysis()} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
           {scenario && page === 'history' && <HistoryPage scenario={scenario} history={historyActions} onRestore={restoreAction} onEvidence={goToEvidence} notesFor={notesFor} onNotesChange={editActionNotes} onNotesSave={saveActionNotes} pendingActionIds={pendingActionIds} />}
-          {page === 'settings' && <div className="settings-scroll" role="region" aria-label="接続と保存の設定" tabIndex={0}><SettingsPage settings={settings} onSettings={setSettings} onSaved={setSettings} onCodexStatus={receiveCodexStatus} codexStatus={codexStatus} onDataFolder={() => window.makua.showDataFolder()} onError={reportError} onDelete={deleteScenario} scenario={scenario} /></div>}
+          {page === 'settings' && <div className="settings-scroll" role="region" aria-label="接続と保存の設定" tabIndex={0}><SettingsPage settings={settings} onSettings={receiveSettings} onSaved={receiveSettings} onCodexStatus={receiveCodexStatus} codexStatus={codexStatus} onDataFolder={() => window.makua.showDataFolder()} onError={reportError} onDelete={deleteScenario} scenario={scenario} /></div>}
           {scenario && sourceView && <SourcePanel view={sourceView} title={sourceName(scenario, sourceView.request.evidenceId, sourceView.request.analysisIndex, { actionId: sourceView.request.actionId, current: sourceView.request.current })} onClose={() => sourceReader.current.close()} onPage={(number) => goToEvidence(sourceView.request.evidenceId, String(number), sourceView.verification, sourceView.request.analysisIndex, { current: sourceView.request.current, actionId: sourceView.request.actionId })}/>}
         </main>
         {scenario && page !== 'settings' && <footer className="session-footer"><span>自動保存</span><span className="footer-dot">·</span><span>{scenario.evidence.length} 件の資料</span><span className="footer-dot">·</span><span>更新 {dateLabel(scenario.updatedAt)}</span>{settings.autoUpdate && <span className="footer-auto">自動更新 ON</span>}<button onClick={exportScenario}>バックアップを書き出す</button><button className="footer-delete" onClick={deleteScenario}>シナリオを削除</button></footer>}
@@ -639,6 +631,14 @@ function SourcePanel({ view, title, onClose, onPage }: { view: SourceViewState; 
     {preview?.text && <details className="source-text" open={preview.kind === 'text' || Boolean(view.error)}><summary>{preview.kind === 'pdf' && !view.error ? 'このページの抽出本文' : '保存された原文'}</summary><pre className="raw-source">{preview.text}</pre></details>}
     {!view.loading && preview && !view.error && !preview.dataUrl && !preview.text && <p className="muted-copy">表示できる本文はありません。</p>}
   </section>;
+}
+
+function AnalysisStatus({ state }: { state: AnalysisUpdateState }) {
+  if (state.phase === 'idle' && !state.dirty) return null;
+  const text = state.phase === 'stopping' ? '更新を停止しています。資料は保存済みです。'
+    : state.phase === 'updating' ? state.pending ? '更新中・追加情報は保存済み。次の更新に反映します。' : '保存済みの情報から更新中…'
+    : state.phase === 'queued' ? '保存済みの情報をまとめて更新します…' : '保存済み・未反映';
+  return <div className="progress-strip analysis-status" role="status" aria-live="polite">{state.phase !== 'idle' && <span className="spinner"/>}{text}</div>;
 }
 
 function EmptyState({ onNew, onDemo }: { onNew: () => void; onDemo: () => void }) {
@@ -721,7 +721,6 @@ function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, on
       </aside>
     </div>}
     {!analysis && <ScenarioSetupForm scenario={scenario} onSave={async (next) => { await next(); }} />}
-    {busy && <div className="progress-strip"><span className="spinner"/>全資料を根拠に解析中。新しい変更が入ると、この結果は保存されません。</div>}
   </div>;
 }
 
@@ -1058,7 +1057,7 @@ function SettingsPage({ settings, onSettings, onSaved, onCodexStatus, codexStatu
         </div>}
       </section>
       <section className="panel settings-panel automation-panel"><div className="panel-top"><div><span className="panel-kicker">02 / WHEN TO ANALYZE</span><h2>資料追加後の自動更新</h2></div><label className="toggle"><input type="checkbox" checked={draft.autoUpdate} onChange={(event) => set('autoUpdate', event.target.checked)} disabled={draft.provider === 'none' || (draft.provider === 'openai' && !draft.cloudConsent) || (draft.provider === 'ollama' && !draft.ollamaModel) || (draft.provider === 'codex' && !draft.codexConsent)}/><span className="toggle-track"/><b>{draft.autoUpdate ? 'ON' : 'OFF'}</b></label></div>
-        <p className="panel-subcopy">ONにすると、シナリオ概要・新しい資料・公開範囲を保存するたび、現在のシナリオにある全資料と方針状態から状況と方針を更新します。追加ごとの確認ダイアログは表示しません。OFFなら「状況を更新」を押した時だけ解析します。</p>
+        <p className="panel-subcopy">ONにすると、シナリオ概要・新しい資料・公開範囲を保存した情報をまとめ、解析対象の全資料と最新の方針履歴から状況と方針を更新します。解析中も保存でき、追加分は次の更新へまとめます。追加ごとの確認ダイアログは表示しません。OFFなら「状況を更新」を押した時だけ解析します。</p>
         <label className="checkbox-row role-consent"><input type="checkbox" checked={draft.includeRoleProfile} onChange={(event) => set('includeRoleProfile', event.target.checked)}/><span><strong>自分の役・目的・秘密を解析に含める</strong><small>ONでは保存された役プロフィールをAIへ渡します。OFFではプロフィールに加え、役情報を使った解析由来・由来不明の過去の方針・仮説・履歴等も送信しません。以前の内容はこのPCの履歴で閲覧できます。同じ役情報がHOに含まれる場合は、HOを含む資料の送信設定に従います。</small></span></label>
         <div className="limit-row"><span>1解析の上限</span><strong>全添付40MiB ・ 抽出テキスト30万文字</strong><small>超える場合は、資料を捨てたり切り詰めたりせず解析を停止します。{draft.provider === 'codex' ? 'CodexではPDF画像200ページ・生成画像40MiBも上限です。' : ''}</small></div>
       </section>

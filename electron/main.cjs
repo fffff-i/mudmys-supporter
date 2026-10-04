@@ -11,6 +11,7 @@ const { getAnalysisContext } = require('../shared/analysisScope.cjs');
 const { actionContextText } = require('../shared/actionHistory.cjs');
 const { getCaseDir } = require('../shared/storage.cjs');
 const { createSerialLock } = require('../shared/serialLock.cjs');
+const { analysisSettingsKey, canAnalyze } = require('../shared/analysisUpdater.mjs');
 const { CodexAppServerClient, CodexAppServerError, buildCodexEnvironment } = require('./codexAppServer.cjs');
 const { prepareCodexInput, cleanupCodexInput, buildCodexDeveloperInstructions, parseStructuredResult } = require('./codexInput.cjs');
 const { extractPdfDocument, renderPdfPage } = require('./pdfDocuments.cjs');
@@ -29,13 +30,16 @@ const MAX_REQUEST_FILE_BYTES = 40 * 1024 * 1024;
 const MAX_ANALYSIS_TEXT_CHARS = 300000;
 const withCaseLock = createSerialLock();
 const withCodexTurnLock = createSerialLock();
+const withSettingsLock = createSerialLock();
+let settingsGeneration = 0;
+let settingsSavePending = 0;
 let mainWindow;
 let codexClient = null;
 let codexClientExecutable = '';
 let codexWorkspace = '';
 let pendingCodexLoginId = '';
 let closingCodexForQuit = false;
-const activeCodexAnalyses = new Map();
+const activeAnalyses = new Map();
 const stagedFiles = new Map();
 
 const ANALYSIS_SCHEMA = {
@@ -153,11 +157,13 @@ async function stopCodexClient() {
   }
 }
 
-async function getCodexClient(preferredPath) {
+async function getCodexClient(preferredPath, requestingRun) {
   const executable = await findCodexExecutable(preferredPath);
   if (codexClient && !codexClient.closed && codexClientExecutable === executable) return codexClient;
   if (codexClient) {
-    if (activeCodexAnalyses.size || pendingCodexLoginId) {
+    // The requesting run owns the Codex turn lock; other Map entries may only
+    // be waiting. It must not block its own replacement of an idle old client.
+    if ((!requestingRun && [...activeAnalyses.values()].some((run) => run.provider === 'codex')) || pendingCodexLoginId) {
       throw new CodexAppServerError('Codex解析またはサインイン中はCLIの場所を変更できません。完了後にもう一度お試しください。', 'CODEX_BUSY');
     }
     await stopCodexClient();
@@ -246,14 +252,14 @@ async function readCase(id) {
   return JSON.parse(content);
 }
 
-async function writeCase(record) {
+async function writeCase(record, beforeCommit = () => {}) {
   const directory = casePath(record.id);
   await fs.mkdir(directory, { recursive: true });
   const temporary = path.join(directory, 'case.json.tmp-' + randomUUID());
   try {
     await fs.writeFile(temporary, JSON.stringify(record, null, 2), 'utf8');
     for (let attempt = 0; ; attempt++) {
-      try { await fs.rename(temporary, path.join(directory, 'case.json')); break; }
+      try { beforeCommit(); await fs.rename(temporary, path.join(directory, 'case.json')); break; }
       catch (error) {
         if (process.platform !== 'win32' || !['EPERM', 'EBUSY'].includes(error.code) || attempt >= 3) throw error;
         await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
@@ -331,6 +337,7 @@ async function publicPreferences() {
     codexModel: value.codexModel || '',
     codexEffort: value.codexEffort || '',
     codexCliPath: value.codexCliPath || '',
+    settingsVersion: settingsGeneration,
     autoUpdate: Boolean(value.autoUpdate),
     includeRoleProfile: Boolean(value.includeRoleProfile),
     cloudConsent: Boolean(value.cloudConsent),
@@ -391,7 +398,7 @@ function renderEvidenceLabel(item) {
   return '[資料ID: ' + item.id + '] [' + visibility + '] [' + (item.kind === 'image' ? '画像' : item.kind === 'pdf' ? 'PDF' : 'テキスト') + '] ' + item.title;
 }
 
-async function openAiRequest(caseRecord, preferences, requestData) {
+async function openAiRequest(caseRecord, preferences, requestData, run) {
   if (!preferences.cloudConsent) throw new Error('OpenAIへ資料を送る設定がオフです。設定画面で送信範囲を確認してから有効にしてください。');
   if (!safeStorage.isEncryptionAvailable()) throw new Error('このWindows環境で暗号化ストレージが利用できません。APIキーを保存できないためOpenAI接続を停止しました。');
   const encrypted = await fs.readFile(KEY_FILE);
@@ -414,6 +421,7 @@ async function openAiRequest(caseRecord, preferences, requestData) {
   }
   const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
   content.push({ type: 'input_text', text: '[更新対象: 現在有効な方針]\n' + JSON.stringify(active.map((a) => ({ id: a.id, title: a.title, step: a.step, rationale: a.rationale }))) });
+  if (run) { await run.check(); run.checkLive(); }
   const result = await client.responses.create({
     model: preferences.model || 'gpt-6-luna',
     instructions,
@@ -422,7 +430,7 @@ async function openAiRequest(caseRecord, preferences, requestData) {
     reasoning: { effort: preferences.effort || 'medium' },
     store: false,
     max_output_tokens: 5000
-  });
+  }, run ? { signal: run.controller.signal } : undefined);
   let output;
   try { output = JSON.parse(result.output_text || ''); }
   catch { throw new Error('AIから解析JSONを受け取れませんでした。前回の状況と方針はそのまま残しています。'); }
@@ -430,7 +438,7 @@ async function openAiRequest(caseRecord, preferences, requestData) {
   return { output, usage: result.usage || null, sourceInputs: sourceInputsForRows(requestData.rows, 'openai') };
 }
 
-async function ollamaRequest(caseRecord, preferences, requestData) {
+async function ollamaRequest(caseRecord, preferences, requestData, run) {
   const endpoint = normalizeOllamaUrl(preferences.ollamaUrl);
   if (!preferences.ollamaModel || !preferences.ollamaModel.trim()) throw new Error('Ollamaモデル名を設定してください。');
   const messages = [{ role: 'system', content: SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord, preferences.includeRoleProfile) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile) }];
@@ -444,11 +452,12 @@ async function ollamaRequest(caseRecord, preferences, requestData) {
   const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
   userText += '\n\n[現在有効な方針ID]\n' + JSON.stringify(active.map((a) => ({ id: a.id, title: a.title, step: a.step, rationale: a.rationale })));
   messages.push({ role: 'user', content: userText, images });
+  if (run) { await run.check(); run.checkLive(); }
   const response = await fetch(endpoint + '/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: preferences.ollamaModel.trim(), messages, stream: false, format: ANALYSIS_SCHEMA }),
-    signal: AbortSignal.timeout(180000)
+    signal: run ? AbortSignal.any([run.controller.signal, AbortSignal.timeout(180000)]) : AbortSignal.timeout(180000)
   });
   if (!response.ok) throw new Error('Ollama接続に失敗しました (' + response.status + '): ' + (await response.text()).slice(0, 300));
   const payload = await response.json();
@@ -460,13 +469,14 @@ async function ollamaRequest(caseRecord, preferences, requestData) {
     sourceInputs: sourceInputsForRows(requestData.rows, 'ollama') };
 }
 
-async function codexRequest(caseRecord, preferences, requestData, signal) {
+async function codexRequest(caseRecord, preferences, requestData, signal, run) {
   return withCodexTurnLock('codex-analysis', async () => {
+    if (run) await run.check();
     if (!preferences.codexConsent) throw new CodexAppServerError('Codexへ資料を送る設定がオフです。設定画面で送信範囲を確認してください。', 'CONSENT_REQUIRED');
     if (signal && signal.aborted) throw new CodexAppServerError('Codex解析をキャンセルしました。', 'CANCELLED');
     const queuedCurrent = await readCase(caseRecord.id);
     if (queuedCurrent.revision !== caseRecord.revision) throw new CodexAppServerError('解析待ちの間にシナリオが更新されました。新しい状態から再解析してください。', 'STALE_INPUT');
-    const client = await getCodexClient(preferences.codexCliPath);
+    const client = await getCodexClient(preferences.codexCliPath, run);
     const auth = await readCodexAuth(client);
     if (!auth.authenticated) throw new CodexAppServerError(codexAuthMessage(auth), auth.reason || 'NOT_AUTHENTICATED');
     const models = await readCodexModels(client);
@@ -483,6 +493,7 @@ async function codexRequest(caseRecord, preferences, requestData, signal) {
         contextText: [roleText(caseRecord, preferences.includeRoleProfile), currentActionsText(caseRecord, preferences.includeRoleProfile), unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile)].join('\n\n')
       });
       const instructions = buildCodexDeveloperInstructions(SYSTEM_PROMPT);
+      if (run) { await run.check(); run.checkLive(); }
       const result = await client.runStructuredTurn({
         input: prepared.input,
         schema: ANALYSIS_SCHEMA,
@@ -502,59 +513,95 @@ async function codexRequest(caseRecord, preferences, requestData, signal) {
   });
 }
 
-async function analyzeCase(id, expectedRevision) {
-  const started = await readCase(id);
-  if (started.revision !== expectedRevision) return { status: 'stale', message: '新しい資料や変更があるため、古い解析結果を破棄しました。' };
-  const preferences = await readPreferences();
-  if (!['openai', 'ollama', 'codex'].includes(preferences.provider)) return { status: 'unconfigured', message: 'AI未接続です。資料と手動メモは保存されています。' };
-  if (preferences.provider === 'openai' && !(await hasStoredKey())) return { status: 'unconfigured', message: 'OpenAI APIキーが未設定です。' };
-  if (preferences.provider === 'openai' && !preferences.cloudConsent) return { status: 'unconfigured', message: 'クラウド送信の同意がありません。設定画面で送信範囲を確認してください。' };
-  if (preferences.provider === 'codex' && !preferences.codexConsent) return { status: 'unconfigured', message: 'Codexへ資料を送る同意がありません。設定画面で送信範囲を確認してください。' };
-  const codexKey = id + '::' + expectedRevision;
-  const codexController = preferences.provider === 'codex' ? new AbortController() : null;
-  if (codexController) {
-    const previous = activeCodexAnalyses.get(codexKey);
-    if (previous) previous.abort();
-    activeCodexAnalyses.set(codexKey, codexController);
+function analysisError(code) {
+  return Object.assign(new Error(code === 'CANCELLED' ? '解析を中止しました。資料と前回結果は保持しています。' : '保存済みの最新入力で更新します。'), { code });
+}
+
+// Checked again synchronously just before network dispatch and atomic rename.
+function assertRunLive(run) {
+  if (run.controller.signal.aborted) throw analysisError(run.controller.signal.reason?.code || 'CANCELLED');
+  if (run.settingsGeneration !== settingsGeneration || settingsSavePending) throw analysisError('STALE_SETTINGS');
+}
+
+async function assertAnalysisCurrent(run, started, preferences) {
+  assertRunLive(run);
+  const [latest, latestPreferences] = await Promise.all([readCase(run.id), readPreferences()]);
+  assertRunLive(run);
+  if (latest.revision !== started.revision) throw analysisError('STALE_INPUT');
+  if (analysisSettingsKey(latestPreferences, true) !== analysisSettingsKey(preferences, true)) throw analysisError('STALE_SETTINGS');
+}
+
+function analyzeCase(id, expectedRevision, options = {}) {
+  const existing = activeAnalyses.get(id);
+  if (existing) {
+    if (options.runId && existing.runId === options.runId && existing.expectedRevision === expectedRevision &&
+      existing.options.settingsVersion === options.settingsVersion && existing.options.automatic === options.automatic) return existing.promise;
+    // Share a barrier, not the previous run's result or cancel identity.
+    // No additional provider request is queued here.
+    return existing.promise.then(() => ({ status: 'busy' }));
   }
+  const run = { id, expectedRevision, runId: options.runId || randomUUID(), legacy: !options.runId,
+    controller: new AbortController(), settingsGeneration, provider: null, options };
+  activeAnalyses.set(id, run);
+  run.promise = Promise.resolve().then(() => performAnalysis(run)).finally(() => {
+    if (activeAnalyses.get(id) === run) activeAnalyses.delete(id);
+  });
+  return run.promise;
+}
+
+async function performAnalysis(run) {
+  const { id, expectedRevision } = run;
+  let preferences = {};
   let requestData = { rows: [], attachmentBytes: 0, textCharacters: 0 };
   try {
-    if (codexController && codexController.signal.aborted) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
+    assertRunLive(run);
+    if (run.options.settingsVersion !== undefined && run.options.settingsVersion !== settingsGeneration) throw analysisError('STALE_SETTINGS');
+    const started = await readCase(id);
+    if (started.revision !== expectedRevision) throw analysisError('STALE_INPUT');
+    preferences = await readPreferences();
+    run.provider = preferences.provider;
+    run.check = () => assertAnalysisCurrent(run, started, preferences);
+    run.checkLive = () => assertRunLive(run);
+    if (!['openai', 'ollama', 'codex'].includes(preferences.provider)) return { status: 'unconfigured', message: 'AI未接続です。資料は保存済みです。' };
+    if (preferences.provider === 'openai' && !(await hasStoredKey())) return { status: 'unconfigured', message: 'OpenAI APIキーが未設定です。' };
+    if (!canAnalyze(preferences)) return { status: 'unconfigured', message: 'AIへ資料を送る設定がオフです。資料は保存済みです。' };
+    if (run.options.automatic && !preferences.autoUpdate) return { status: 'cancelled', message: '自動更新は停止しました。資料は保存済みです。' };
     requestData = await evidenceForRequest(started, preferences.includeRoleProfile, preferences.provider);
-    if (codexController && codexController.signal.aborted) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
+    await run.check();
     const response = preferences.provider === 'openai'
-      ? await openAiRequest(started, preferences, requestData)
+      ? await openAiRequest(started, preferences, requestData, run)
       : preferences.provider === 'ollama'
-        ? await ollamaRequest(started, preferences, requestData)
-        : await codexRequest(started, preferences, requestData, codexController.signal);
-    return await withCaseLock(id, async () => {
+        ? await ollamaRequest(started, preferences, requestData, run)
+        : await codexRequest(started, preferences, requestData, run.controller.signal, run);
+    // Lock only the short commit, never AI waiting.
+    return await withSettingsLock('preferences', () => withCaseLock(id, async () => {
+      await run.check();
       const latest = await readCase(id);
-      if (latest.revision !== expectedRevision) return { status: 'stale', message: '解析中にシナリオが更新されたため、古い結果は保存しませんでした。' };
-      const output = response.output;
-      // Persist automatic legacy PDF metadata upgrades with this result, under
-      // the same revision guard as the input actually sent.
+      assertRunLive(run);
+      if (latest.revision !== expectedRevision) throw analysisError('STALE_INPUT');
       const sentItems = new Map(requestData.rows.map(({ item }) => [item.id, item]));
       const inputRecord = { ...latest, evidence: latest.evidence.map((item) => sentItems.get(item.id) || item) };
-      const updated = applyAnalysis(inputRecord, output, expectedRevision, new Date().toISOString(), {
+      const updated = applyAnalysis(inputRecord, response.output, expectedRevision, new Date().toISOString(), {
         includeRoleProfile: preferences.includeRoleProfile === true,
         evidenceIds: requestData.rows.map(({ item }) => item.id),
         sourceInputs: response.sourceInputs
       });
       updated.analysis.usage = response.usage;
-      updated.analysis.provider = output.provider;
-      await writeCase(updated);
-      return { status: 'ok', scenario: updated, usage: response.usage, attachmentBytes: requestData.attachmentBytes, textCharacters: requestData.textCharacters, pdfPages: response.pdfPages, imageBytes: response.imageBytes };
-    });
+      updated.analysis.provider = response.output.provider;
+      updated.analysis.settingsKey = analysisSettingsKey(preferences);
+      await writeCase(updated, run.checkLive);
+      return { status: 'ok', scenario: updated, usage: response.usage, attachmentBytes: requestData.attachmentBytes,
+        textCharacters: requestData.textCharacters, pdfPages: response.pdfPages, imageBytes: response.imageBytes };
+    }));
   } catch (error) {
-    if (codexController && (codexController.signal.aborted || error.code === 'CANCELLED')) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
-    if (error && error.code === 'STALE_INPUT') return { status: 'stale', message: error.message };
+    const code = run.controller.signal.aborted ? run.controller.signal.reason?.code || 'CANCELLED' : error?.code;
+    if (code === 'CANCELLED') return { status: 'cancelled', message: '解析を中止しました。資料と前回結果は保持しています。' };
+    if (code === 'STALE_INPUT' || code === 'STALE_SETTINGS') return { status: 'stale', message: '保存済みの最新入力で更新します。' };
     let secret;
     if (preferences.provider === 'openai' && safeStorage.isEncryptionAvailable()) {
       try { secret = safeStorage.decryptString(await fs.readFile(KEY_FILE)); } catch { secret = ''; }
     }
-    return { status: 'error', message: noSecrets(error && error.message, secret), attachmentBytes: requestData.attachmentBytes, textCharacters: requestData.textCharacters };
-  } finally {
-    if (codexController && activeCodexAnalyses.get(codexKey) === codexController) activeCodexAnalyses.delete(codexKey);
+    return { status: 'error', message: noSecrets(error?.message, secret), attachmentBytes: requestData.attachmentBytes, textCharacters: requestData.textCharacters };
   }
 }
 
@@ -584,8 +631,8 @@ function createWindow() {
 
 ipcMain.handle('app:get-info', async () => ({ version: app.getVersion(), platform: process.platform, dataFolder: APP_DIR }));
 ipcMain.handle('app:show-data-folder', async () => { await shell.openPath(APP_DIR); return true; });
-ipcMain.handle('settings:get', publicPreferences);
-ipcMain.handle('settings:save', async (_event, input) => {
+ipcMain.handle('settings:get', () => withSettingsLock('preferences', publicPreferences));
+ipcMain.handle('settings:save', async (_event, input) => withSettingsLock('preferences', async () => {
   input = input && typeof input === 'object' ? input : {};
   const safe = {
     provider: ['none', 'openai', 'ollama', 'codex'].includes(input.provider) ? input.provider : 'none',
@@ -604,16 +651,25 @@ ipcMain.handle('settings:save', async (_event, input) => {
   if (safe.model === 'gpt-6-astra' && safe.effort === 'none') throw new Error('GPT-6 Astraでは推論強度 none を選べません。');
   if (safe.provider === 'openai' && safe.autoUpdate && !safe.cloudConsent) throw new Error('自動更新を使うには資料送信範囲の確認が必要です。');
   if (safe.provider === 'codex' && safe.autoUpdate && !safe.codexConsent) throw new Error('Codexで自動更新を使うには資料送信範囲の確認が必要です。');
-  await fs.mkdir(APP_DIR, { recursive: true });
-  await fs.writeFile(PREFS_FILE, JSON.stringify(safe, null, 2), 'utf8');
-  const apiKey = String(input.apiKey || '').trim();
-  if (apiKey) {
-    if (!safeStorage.isEncryptionAvailable()) throw new Error('このWindows環境で暗号化ストレージを利用できません。APIキーを保存できません。');
-    await fs.writeFile(KEY_FILE, safeStorage.encryptString(apiKey));
-  }
-  if (input.removeKey) await fs.rm(KEY_FILE, { force: true });
-  return publicPreferences();
-});
+  settingsGeneration++;
+  settingsSavePending++;
+  for (const run of activeAnalyses.values()) run.controller.abort(analysisError('STALE_SETTINGS'));
+  try {
+    await fs.mkdir(APP_DIR, { recursive: true });
+    const apiKey = String(input.apiKey || '').trim();
+    if (apiKey) {
+      if (!safeStorage.isEncryptionAvailable()) throw new Error('このWindows環境で暗号化ストレージを利用できません。APIキーを保存できません。');
+      await fs.writeFile(KEY_FILE, safeStorage.encryptString(apiKey));
+    }
+    if (input.removeKey) await fs.rm(KEY_FILE, { force: true });
+    const temporary = PREFS_FILE + '.tmp-' + randomUUID();
+    try {
+      await fs.writeFile(temporary, JSON.stringify(safe, null, 2), 'utf8');
+      await fs.rename(temporary, PREFS_FILE);
+    } finally { await fs.rm(temporary, { force: true }); }
+    return await publicPreferences();
+  } finally { settingsSavePending--; }
+}));
 ipcMain.handle('settings:test-ai', async (_event, input) => {
   const saved = await readPreferences();
   const requestedProvider = input && ['none', 'openai', 'ollama', 'codex'].includes(input.provider) ? input.provider : saved.provider;
@@ -746,7 +802,9 @@ ipcMain.handle('scenario:create-demo', async () => {
   return record;
 });
 ipcMain.handle('scenario:save-profile', async (_event, payload) => mutateCase(payload.id, (current) => {
-  if (current.revision !== payload.expectedRevision) throw new Error('別の操作で更新されました。画面を読み直してください。');
+  const profile = { title: current.title, synopsis: current.synopsis, role: current.roleProfile?.role || '', goal: current.roleProfile?.goal || '', secret: current.roleProfile?.secret || '' };
+  const matchesProfile = payload.expectedProfile && Object.keys(profile).every((key) => profile[key] === payload.expectedProfile[key]);
+  if (current.revision !== payload.expectedRevision && !matchesProfile) throw new Error('シナリオ情報が別の操作で変更されました。入力中の内容は保持しています。');
   return { ...current, title: String(payload.title || '').trim() || '新しいシナリオ', synopsis: String(payload.synopsis || ''), roleProfile: { role: String(payload.role || ''), goal: String(payload.goal || ''), secret: String(payload.secret || '') }, revision: current.revision + 1, updatedAt: new Date().toISOString() };
 }));
 ipcMain.handle('scenario:delete', async (_event, id) => {
@@ -754,6 +812,7 @@ ipcMain.handle('scenario:delete', async (_event, id) => {
     const record = await readCase(id);
     const answer = await dialog.showMessageBox(mainWindow, { type: 'warning', title: 'シナリオと資料を削除', message: '「' + record.title + '」を削除しますか？', detail: 'このシナリオの状況・方針履歴・添付資料をこのアプリから削除します。先に残す場合はエクスポートしてください。', buttons: ['キャンセル', 'このシナリオを削除'], defaultId: 0, cancelId: 0, noLink: true });
     if (answer.response !== 1) return { deleted: false };
+    activeAnalyses.get(id)?.controller.abort(analysisError('CANCELLED'));
     await fs.rm(casePath(id), { recursive: true, force: false });
     for (const [token, file] of stagedFiles) if (file.id === id) stagedFiles.delete(token);
     return { deleted: true };
@@ -971,14 +1030,11 @@ ipcMain.handle('scenario:discard-action', async (_event, payload) => mutateCase(
 ipcMain.handle('scenario:action-notes', async (_event, payload) => mutateCase(payload.id, async (current) =>
   updateActionNotes(current, payload.actionId, { reason: payload.reason, resultNote: payload.resultNote }, new Date().toISOString(), await readPreferences())));
 ipcMain.handle('scenario:restore-action', async (_event, payload) => mutateCase(payload.id, (current) => restoreAction(current, payload.actionId)));
-ipcMain.handle('scenario:analyze', async (_event, payload) => analyzeCase(payload.id, payload.expectedRevision));
+ipcMain.handle('scenario:analyze', async (_event, payload) => analyzeCase(payload.id, payload.expectedRevision, payload));
 ipcMain.handle('scenario:cancel-analysis', async (_event, payload) => {
-  const id = String(payload && payload.id || '');
-  const revision = Number(payload && payload.expectedRevision);
-  if (!id || !Number.isSafeInteger(revision)) return { canceled: false };
-  const controller = activeCodexAnalyses.get(id + '::' + revision);
-  if (!controller) return { canceled: false };
-  controller.abort();
+  const run = activeAnalyses.get(String(payload?.id || ''));
+  if (!run || (payload.runId ? run.runId !== payload.runId : !run.legacy || run.expectedRevision !== Number(payload.expectedRevision))) return { canceled: false };
+  run.controller.abort(analysisError('CANCELLED'));
   return { canceled: true };
 });
 
@@ -989,10 +1045,10 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', (event) => {
+  for (const run of activeAnalyses.values()) run.controller.abort(analysisError('CANCELLED'));
   if (closingCodexForQuit || !codexClient) return;
   event.preventDefault();
   closingCodexForQuit = true;
-  for (const controller of activeCodexAnalyses.values()) controller.abort();
   Promise.resolve(stopCodexClient()).finally(() => app.quit());
 });
 
