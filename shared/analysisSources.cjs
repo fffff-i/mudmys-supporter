@@ -1,3 +1,4 @@
+const { getAnalysisContext } = require('./analysisScope.cjs');
 const SYNOPSIS_SOURCE_ID = 'scenario:synopsis';
 const ROLE_PROFILE_SOURCE_ID = 'scenario:role-profile';
 
@@ -46,11 +47,7 @@ function roleText(caseRecord, includeRoleProfile) {
 }
 
 function unconfirmedAssumptionsText(caseRecord, includeRoleProfile) {
-  const analysis = caseRecord.analysis;
-  if (!analysis) return '';
-  // Old results have no trustworthy input provenance. Do not introduce a new
-  // route for role-derived hypotheses when the profile is excluded.
-  if (!includeRoleProfile && (analysis.grounding?.includeRoleProfile !== false || analysis.grounding?.previousContextMayIncludeRoleProfile)) return '';
+  const { analysis } = getAnalysisContext(caseRecord, includeRoleProfile).caseRecord;
   const hypotheses = (analysis.hypotheses || []).map((item) => ({
     statement: item.statement, why: item.why, assumptions: item.assumptions || [], evidenceIds: item.evidenceIds || []
   }));

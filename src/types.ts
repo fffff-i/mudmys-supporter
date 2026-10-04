@@ -40,6 +40,7 @@ export type Action = {
   evidenceIds: string[];
   // Optional for saved results from earlier versions. New analyses store an array.
   assumptions?: string[];
+  grounding?: AnalysisGrounding;
   status: string;
   createdAt: string;
   updatedAt?: string;
@@ -55,6 +56,16 @@ export type AnalysisSource = Pick<Evidence, 'id' | 'title' | 'kind' | 'extracted
 export type Fact = { statement: string; evidenceIds: [string, ...string[]] };
 export type Hypothesis = { statement: string; why: string; evidenceIds: string[]; assumptions?: string[] };
 
+export type AnalysisGrounding = {
+  // Older saved data lacks the complete input record and stays protected.
+  version?: 1;
+  includeRoleProfile: boolean;
+  previousContextMayIncludeRoleProfile?: boolean;
+  evidenceIds: string[];
+  contextActionIds?: string[];
+  contextHistoryActionIds?: string[];
+};
+
 export type Analysis = {
   revision: number;
   inputRevision: number;
@@ -69,7 +80,7 @@ export type Analysis = {
   actions: Action[];
   // App-owned snapshots of the fixed sources actually used in this analysis.
   sources?: AnalysisSource[];
-  grounding?: { includeRoleProfile: boolean; previousContextMayIncludeRoleProfile?: boolean; evidenceIds: string[] };
+  grounding?: AnalysisGrounding;
   usage?: { input_tokens?: number; output_tokens?: number } | null;
 };
 
@@ -102,6 +113,8 @@ export type Scenario = {
   roleProfile: { role: string; goal: string; secret: string };
   evidence: Evidence[];
   analysis: Analysis | null;
+  // Local snapshots excluded by the profile scope; never used as AI context.
+  analysisHistory?: Analysis[];
   actionHistory: Action[];
   revision: number;
   createdAt: string;

@@ -7,7 +7,7 @@ function fixture() {
   return {
     id: 'case-a', revision: 4, updatedAt: '2026-09-27T00:00:00.000Z',
     evidence: [{ id: 'ev-1', title: '温室のメモ' }],
-    analysis: { grounding: { includeRoleProfile: false }, actions: [{ id: 'act-1', title: '時刻を照合する', status: 'active', createdAt: '2026-09-26T00:00:00.000Z' }] },
+    analysis: { grounding: { version: 1, includeRoleProfile: false, previousContextMayIncludeRoleProfile: false, evidenceIds: ['ev-1'] }, actions: [{ id: 'act-1', title: '時刻を照合する', status: 'active', createdAt: '2026-09-26T00:00:00.000Z', grounding: { version: 1, includeRoleProfile: false, previousContextMayIncludeRoleProfile: false, evidenceIds: ['ev-1'] } }] },
     actionHistory: []
   };
 }
@@ -188,17 +188,22 @@ test('reserved fixed IDs cannot be introduced as evidence to bypass profile scop
   }
 });
 
-test('new hypothesis context stays protected after an OFF update reuses role-derived or legacy actions', () => {
-  for (const grounding of [undefined, { includeRoleProfile: true }]) {
+test('an OFF update omits role-derived or legacy actions without requiring their dispositions', () => {
+  for (const grounding of [undefined, { includeRoleProfile: true }, { includeRoleProfile: false }]) {
     const base = fixture();
     base.analysis.grounding = grounding;
+    base.analysis.actions[0].grounding = grounding;
     base.analysis.actions[0].assumptions = ['PROFILE_CONDITION_MARKER'];
-    const saved = applyAnalysis(base, response(), 4);
+    const output = response({ actions: [{ ...response().actions[0], continuesActionIds: [] }] });
+    const saved = applyAnalysis(base, output, 4);
     assert.equal(saved.analysis.grounding.includeRoleProfile, false);
-    assert.equal(saved.analysis.grounding.previousContextMayIncludeRoleProfile, true);
-    assert.deepEqual(saved.analysis.actions[0].assumptions, ['PROFILE_CONDITION_MARKER']);
+    assert.equal(saved.analysis.grounding.previousContextMayIncludeRoleProfile, false);
+    assert.deepEqual(saved.analysis.actions[0].assumptions, []);
+    assert.equal(saved.actionHistory[0].id, 'act-1');
+    assert.deepEqual(saved.actionHistory[0].assumptions, ['PROFILE_CONDITION_MARKER']);
+    assert.deepEqual(saved.analysisHistory[0], base.analysis);
     assert.equal(unconfirmedAssumptionsText(saved, false), '');
-    const subsequent = applyAnalysis(saved, response(), 5);
+    const subsequent = applyAnalysis(saved, response({ actions: [{ ...response().actions[0], continuesActionIds: [saved.analysis.actions[0].id] }] }), 5);
     assert.equal(unconfirmedAssumptionsText(subsequent, false), '');
   }
 });

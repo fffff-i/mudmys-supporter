@@ -36,9 +36,14 @@ function typeLabel(type: string) {
   return ({ observed: '直接観察', reported: '伝聞', statement: '発言', recorded: '記録', inference: '推測', unknown: '不明' } as Record<string, string>)[type] || '不明';
 }
 
+function savedAnalysisSources(scenario: Scenario) {
+  const sources = [...(scenario.analysis?.sources || []), ...(scenario.analysisHistory || []).slice().reverse().flatMap((analysis) => analysis.sources || [])];
+  return sources.filter((source, index) => sources.findIndex((item) => item.id === source.id && item.extractedText === source.extractedText) === index);
+}
+
 function sourceName(scenario: Scenario, id: string) {
   const index = scenario.evidence.findIndex((entry) => entry.id === id);
-  return index >= 0 ? '資料 ' + String(index + 1).padStart(2, '0') + '　' + scenario.evidence[index].title : scenario.analysis?.sources?.find((source) => source.id === id)?.title || '資料がありません';
+  return index >= 0 ? '資料 ' + String(index + 1).padStart(2, '0') + '　' + scenario.evidence[index].title : savedAnalysisSources(scenario).find((source) => source.id === id)?.title || '資料がありません';
 }
 
 function App() {
@@ -504,7 +509,7 @@ function SectionHeading({ overline, title, note }: { overline: string; title: st
 
 function Citation({ scenario, id, onEvidence }: { scenario: Scenario; id: string; onEvidence: (id: string) => void }) {
   const index = scenario.evidence.findIndex((item) => item.id === id);
-  const source = scenario.analysis?.sources?.find((item) => item.id === id);
+  const source = savedAnalysisSources(scenario).find((item) => item.id === id);
   if (source) return <button className="citation-chip" onClick={() => onEvidence(id)} title="解析に使った内容を開く">{source.title}　↗</button>;
   if (index < 0) return <span className="citation-missing">資料なし</span>;
   return <button className="citation-chip" onClick={() => onEvidence(id)} title="元の資料を開く">証拠 {String(index + 1).padStart(2, '0')}　↗</button>;
@@ -556,7 +561,7 @@ function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, on
           <div className="role-name">{scenario.roleProfile?.role || '役が未入力'}</div>
           <p>{scenario.roleProfile?.goal || '役の目的が分かると、質問の順番をあなたの狙いに合わせられます。'}</p>
           <div className="secret-row"><span>秘密</span><span>{scenario.roleProfile?.secret ? '登録済み' : '未登録'}</span><span className="secret-eye">◈</span></div>
-          <div className="role-scope-note">{settings.includeRoleProfile ? '次回の解析に役・目的・秘密を含める設定です。' : '役・秘密は保存済み。次回解析にはまだ含めません。'}</div>
+          <div className="role-scope-note">{settings.includeRoleProfile ? '次回の解析に役・目的・秘密を含める設定です。' : '役プロフィールと役情報由来・由来不明の過去の整理結果は送信しません。HO内の役情報は資料の送信設定に従います。'}</div>
         </section>
         <section className="quick-plans">
           <div className="quick-plans-head"><div><span className="eyebrow">NEXT MOVES</span><h3>次に確かめること</h3></div><button onClick={onPlans}>すべて <span>→</span></button></div>
@@ -631,7 +636,7 @@ function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, 
         </form>
       </div>
       <div className="evidence-list-column">
-        {scenario.analysis?.sources?.filter((source) => source.id === selected).map((source) => <article key={source.id} id={'evidence-' + source.id} className="evidence-card selected">
+        {savedAnalysisSources(scenario).filter((source) => source.id === selected).map((source, index) => <article key={source.id + '-' + index} id={'evidence-' + source.id + (index ? '-' + index : '')} className="evidence-card selected">
           <div className="evidence-card-head"><strong>{source.title}</strong><ScopeBadge visibility={source.visibility}/></div>
           <div className="evidence-detail"><p className="muted-copy">解析に使った内容</p><pre className="raw-source">{source.extractedText}</pre></div>
         </article>)}
@@ -692,7 +697,7 @@ function PlansPage({ scenario, actions, settings, busy, onAnalyze, onEvidence, o
 }
 
 function getActionVisibility(scenario: Scenario, action: Action): Visibility {
-  const scopes = action.evidenceIds.map((id) => (scenario.evidence.find((item) => item.id === id) || scenario.analysis?.sources?.find((item) => item.id === id))?.visibility).filter(Boolean) as Visibility[];
+  const scopes = action.evidenceIds.map((id) => (scenario.evidence.find((item) => item.id === id) || savedAnalysisSources(scenario).find((item) => item.id === id))?.visibility).filter(Boolean) as Visibility[];
   if (scopes.includes('private')) return 'private';
   if (scopes.includes('unknown') || !scopes.length) return 'unknown';
   return 'shared';
@@ -704,9 +709,20 @@ function HistoryPage({ scenario, history, onRestore, onEvidence }: { scenario: S
     <div className="page-intro"><div><div className="eyebrow">DECISION TRAIL</div><h1>方針の履歴</h1><p>棄却・対応済み・解析更新で外れた方針を、理由とつながりごとに残します。</p></div><div className="intro-metrics"><div><span>{history.length.toString().padStart(2, '0')}</span><small>記録</small></div></div></div>
     {history.length ? <div className="history-list">{[...history].reverse().map((action, index) => <article className="history-card" key={action.id + '-' + index}>
       <div className="history-status"><span className={'history-mark status-' + action.status}>{action.status === 'completed' ? '✓' : action.status === 'discarded' ? '×' : '↶'}</span><div><strong>{label(action.status)}</strong><small>{dateLabel(action.retiredAt || action.updatedAt || action.createdAt)}</small></div></div>
-      <div className="history-main"><h3>{action.title}</h3><Assumptions values={action.assumptions}/><p>{action.retirementReason || '理由の記録はありません。'}</p><div className="history-meta"><span>対象: {action.who || '未特定'}</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div></div>
+      <div className="history-main"><h3>{action.title}</h3><Assumptions values={action.assumptions}/><p>{action.retirementReason || '理由の記録はありません。'}</p><details><summary>保存した方針を見る</summary><p>{action.step}</p><p>{action.suggestedLine}</p><p>{action.purpose}</p><p>{action.rationale}</p><p>{action.secretRisk}</p></details><div className="history-meta"><span>対象: {action.who || '未特定'}</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div></div>
       {action.status === 'discarded' && <button className="button button-light restore-button" onClick={() => onRestore(action)}>明示的に復帰</button>}
     </article>)}</div> : <div className="no-evidence"><div className="no-evidence-mark">↶</div><strong>まだ履歴はありません</strong><p>方針を対応済み・棄却・置き換えにしたとき、ここに理由と日時が残ります。</p></div>}
+    {(scenario.analysisHistory || []).slice().reverse().map((analysis, index) => <details className="panel previous-analysis" key={analysis.revision + '-' + index}>
+      <summary>送信対象から外した以前の整理結果 · {dateLabel(analysis.updatedAt)}</summary>
+      <p className="muted-copy">このPCで閲覧できます。役情報OFFの解析には送信しません。</p>
+      <p>{analysis.overview}</p>
+      {(analysis.flow || []).map((item, itemIndex) => <p key={'flow-' + itemIndex}>{item.moment} · {item.summary}</p>)}
+      {(analysis.events || []).map((event, eventIndex) => <EventRow key={'event-' + eventIndex} event={event} scenario={{ ...scenario, analysis }} onEvidence={onEvidence}/>)}
+      <h4>資料にある事実</h4>{(analysis.facts || []).map((item, itemIndex) => <p key={'fact-' + itemIndex}>{item.statement} <Citations scenario={{ ...scenario, analysis }} ids={item.evidenceIds} onEvidence={onEvidence}/></p>)}
+      <h4>仮説・読み取り</h4>{(analysis.hypotheses || []).map((item, itemIndex) => <div key={'hypothesis-' + itemIndex}><p>{item.statement}</p><p>{item.why}</p><Assumptions values={item.assumptions}/><Citations scenario={{ ...scenario, analysis }} ids={item.evidenceIds} onEvidence={onEvidence}/></div>)}
+      <h4>まだ未確認</h4>{(analysis.unknowns || []).map((item, itemIndex) => <p key={'unknown-' + itemIndex}>{item.question} · {item.why} <Citations scenario={{ ...scenario, analysis }} ids={item.evidenceIds} onEvidence={onEvidence}/></p>)}
+      <h4>その時の方針</h4>{(analysis.actions || []).map((action, actionIndex) => <details key={action.id + '-' + actionIndex}><summary>{action.title} · {action.who || '対象未特定'}</summary><p>{action.step}</p><p>{action.suggestedLine}</p><p>{action.purpose}</p><p>{action.rationale}</p><p>{action.secretRisk}</p><Assumptions values={action.assumptions}/><Citations scenario={{ ...scenario, analysis }} ids={action.evidenceIds} onEvidence={onEvidence}/></details>)}
+    </details>)}
   </div>;
 }
 
@@ -806,7 +822,7 @@ function SettingsPage({ settings, onSettings, onSaved, onCodexStatus, codexStatu
           <div className="privacy-callout"><span>◈</span><div><strong>キーはWindowsの暗号化ストレージに保存</strong><p>キーを画面へ再表示せず、ソース・ログ・バックアップには含めません。アプリはOpenAI APIへ直接接続します。</p></div></div>
           {settings.hasKey && <label className="checkbox-row danger-check"><input type="checkbox" checked={removeKey} onChange={(event) => setRemoveKey(event.target.checked)}/>保存済みのAPIキーを削除</label>}
           <div className="pricing-note"><strong>費用の目安（公式単価）</strong><p>Lunaは入力 $0.10 / 出力 $0.50、Solは $2 / $10、Astraは $10 / $50（100万トークンあたり）。画像・PDFページは追加の入力トークンになり、実際の請求額は送信量と利用状況で変わります。速度はこのPCから実測していません。</p><small>標準は低コストのGPT-6 Luna / medium。モデルはいつでも切替でき、上位モデルへ自動昇格しません。</small></div>
-          <label className="checkbox-row consent-row"><input type="checkbox" checked={draft.cloudConsent} onChange={(event) => set('cloudConsent', event.target.checked)}/><span><strong>OpenAIへ資料を送ることを理解しました。</strong><small>シナリオ概要・全テキスト資料・PDF原本・画像に加え、現在有効な方針と手動棄却した方針の見出しも送信します。役・目的・秘密は「自分の役・目的・秘密を解析に含める」をONにした場合だけ送ります。接続テストと解析はAPI利用料がかかる場合があります。</small></span></label>
+          <label className="checkbox-row consent-row"><input type="checkbox" checked={draft.cloudConsent} onChange={(event) => set('cloudConsent', event.target.checked)}/><span><strong>OpenAIへ資料を送ることを理解しました。</strong><small>シナリオ概要・全テキスト資料・PDF原本・画像に加え、役情報の送信設定で許可された有効方針・仮説・棄却履歴を送信します。プロフィールと過去の整理結果の送信範囲は下の設定に従います。接続テストと解析はAPI利用料がかかる場合があります。</small></span></label>
         </div>}
         {draft.provider === 'ollama' && <div className="provider-fields"><div className="settings-fields-row"><label className="field-label">localhost URL<input value={draft.ollamaUrl} onChange={(event) => set('ollamaUrl', event.target.value)} placeholder="http://localhost:11434"/></label><label className="field-label">モデル名<input value={draft.ollamaModel} onChange={(event) => set('ollamaModel', event.target.value)} placeholder="インストール済みのモデル名"/></label></div><div className="privacy-callout"><span>⌂</span><div><strong>ローカル接続として確認するのはlocalhostのみ</strong><p>画像は選択モデルへ送りますが、モデルごとのVision対応は自動判定していません。PDFはローカル抽出できたテキストだけを送り、ページ画像は解析しません。</p></div></div></div>}
         {draft.provider === 'codex' && <div className="provider-fields codex-fields">
@@ -823,14 +839,14 @@ function SettingsPage({ settings, onSettings, onSaved, onCodexStatus, codexStatu
           <div className="codex-connection-row"><div><strong>{codexStatus?.ready ? '接続済み' : codexStatus?.authenticated ? 'サインイン済み・モデル未確認' : '接続状態未確認'}</strong><small>{codexStatus?.planType ? 'ChatGPTプラン: ' + codexStatus.planType : '専用profileのChatGPTサインインを確認します。'}</small></div><div className="codex-connection-actions"><button type="button" className="button button-light" onClick={startCodexLogin} disabled={testing}>{testing ? '確認中…' : 'ChatGPTでサインイン'}</button><button type="button" className="button button-light" onClick={test} disabled={testing}>{testing ? '確認中…' : '接続状態を確認'}</button>{loginCode && <button type="button" className="text-button" onClick={cancelCodexLogin} disabled={testing}>サインインを中止</button>}</div></div>
           {loginCode && <div className="codex-login-code"><div><span>公式デバイス認証URL（自分で開いてください）</span><code>{loginCode.verificationUrl}</code></div><div><span>一時コード</span><code>{loginCode.userCode}</code></div><small>アプリはブラウザーを開きません。コードを入力した後、この画面の「接続状態を確認」を押してください。</small></div>}
           {codexUsage && <div className="codex-usage"><strong>Codex利用枠</strong><span>現在のウィンドウ使用量 {codexUsage.usedPercent}%</span>{codexUsage.resetsAt && <small>リセット予定: {new Intl.DateTimeFormat('ja-JP', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(codexUsage.resetsAt * 1000))}</small>}</div>}
-          <div className="privacy-callout codex-callout"><span>◈</span><div><strong>PlusのCodex枠を使う実験的な接続</strong><p>Platform APIキー・API従量課金へ切り替えません。アプリ専用profileに公式ChatGPT managed sign-inを行い、そのCodex利用枠を使います。通常のCodex profileにある認証ファイルやMCP設定は引き継ぎません。</p><p>解析時はシナリオ概要・全テキスト・画像・PDF抽出全文と全ページ画像、現在有効な方針と手動棄却した方針の見出しをCodexへ送ります。役・目的・秘密は下の同意をONにした時だけ含みます。PDF画像は解析後に一時ファイルを削除し、原本はローカルに残します。</p><p>shell、apps、remote plugins、multi-agent、web searchを設定で無効化し、read-only sandboxとネットワーク無効を指定します。未対応のツール/権限要求は受け入れません。ただしread-only sandboxに読み取り対象を個別指定する仕組みはなく、App Serverも内部機能すべてを無効にできる保証はありません。空の作業フォルダーだけにアクセスを限定できるとは言えないため、実験的な接続の制約を理解してから使ってください。</p></div></div>
+          <div className="privacy-callout codex-callout"><span>◈</span><div><strong>PlusのCodex枠を使う実験的な接続</strong><p>Platform APIキー・API従量課金へ切り替えません。アプリ専用profileに公式ChatGPT managed sign-inを行い、そのCodex利用枠を使います。通常のCodex profileにある認証ファイルやMCP設定は引き継ぎません。</p><p>解析時はシナリオ概要・全テキスト・画像・PDF抽出全文と全ページ画像に加え、役情報の送信設定で許可された有効方針・仮説・棄却履歴をCodexへ送ります。プロフィールと過去の整理結果の送信範囲は下の設定に従います。PDF画像は解析後に一時ファイルを削除し、原本はローカルに残します。</p><p>shell、apps、remote plugins、multi-agent、web searchを設定で無効化し、read-only sandboxとネットワーク無効を指定します。未対応のツール/権限要求は受け入れません。ただしread-only sandboxに読み取り対象を個別指定する仕組みはなく、App Serverも内部機能すべてを無効にできる保証はありません。空の作業フォルダーだけにアクセスを限定できるとは言えないため、実験的な接続の制約を理解してから使ってください。</p></div></div>
           <div className="pricing-note"><strong>アプリ側の解析上限とモデル選択</strong><p>資料は切り捨てず、1解析の添付合計40MiB・入力全文字数30万字・PDF合計200ページ・生成画像40MiBを超えると停止します。これはCodexの公称上限ではなく、このアプリの安全上限です。利用できるモデルと画像対応はCodexの一覧を取得して表示し、自動で別モデルへ切り替えません。</p></div>
           <label className="checkbox-row consent-row"><input type="checkbox" checked={draft.codexConsent} onChange={(event) => set('codexConsent', event.target.checked)}/><span><strong>Codexへ資料を送ることを理解しました。</strong><small>同意すると手動解析が有効になります。自動更新をONにした場合は、資料変更後に追加確認なしで同じ範囲を送ります。</small></span></label>
         </div>}
       </section>
       <section className="panel settings-panel automation-panel"><div className="panel-top"><div><span className="panel-kicker">02 / WHEN TO ANALYZE</span><h2>資料追加後の自動更新</h2></div><label className="toggle"><input type="checkbox" checked={draft.autoUpdate} onChange={(event) => set('autoUpdate', event.target.checked)} disabled={draft.provider === 'none' || (draft.provider === 'openai' && !draft.cloudConsent) || (draft.provider === 'ollama' && !draft.ollamaModel) || (draft.provider === 'codex' && !draft.codexConsent)}/><span className="toggle-track"/><b>{draft.autoUpdate ? 'ON' : 'OFF'}</b></label></div>
         <p className="panel-subcopy">ONにすると、シナリオ概要・新しい資料・公開範囲を保存するたび、現在のシナリオにある全資料と方針状態から状況と方針を更新します。追加ごとの確認ダイアログは表示しません。OFFなら「状況を更新」を押した時だけ解析します。</p>
-        <label className="checkbox-row role-consent"><input type="checkbox" checked={draft.includeRoleProfile} onChange={(event) => set('includeRoleProfile', event.target.checked)}/><span><strong>自分の役・目的・秘密を解析に含める</strong><small>保存された役情報を毎回AIへ渡し、目的達成や秘密を守る行動を提案します。OFFならシナリオ資料だけを使います。</small></span></label>
+        <label className="checkbox-row role-consent"><input type="checkbox" checked={draft.includeRoleProfile} onChange={(event) => set('includeRoleProfile', event.target.checked)}/><span><strong>自分の役・目的・秘密を解析に含める</strong><small>ONでは保存された役プロフィールをAIへ渡します。OFFではプロフィールに加え、役情報を使った解析由来・由来不明の過去の方針・仮説・履歴等も送信しません。以前の内容はこのPCの履歴で閲覧できます。同じ役情報がHOに含まれる場合は、HOを含む資料の送信設定に従います。</small></span></label>
         <div className="limit-row"><span>1解析の上限</span><strong>全添付40MiB ・ 抽出テキスト30万文字</strong><small>超える場合は、資料を捨てたり切り詰めたりせず解析を停止します。{draft.provider === 'codex' ? 'CodexではPDF画像200ページ・生成画像40MiBも上限です。' : ''}</small></div>
       </section>
       <div className="settings-save-row"><div>{testResult && <p className="test-result">{testResult}</p>}</div><div><button type="button" className="button button-light" onClick={test} disabled={testing || draft.provider === 'none'}>{testing ? '確認中…' : '接続をテスト'}</button><button type="submit" className="button button-ink" disabled={saving}>{saving ? '保存中…' : '設定を保存'}</button></div></div>

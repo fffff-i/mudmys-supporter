@@ -6,7 +6,8 @@ const { execFileSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const OpenAI = require('openai').default;
 const { applyAnalysis, discardAction, restoreAction } = require('../shared/analysisLifecycle.cjs');
-const { synopsisText, roleText, unconfirmedAssumptionsText } = require('../shared/analysisSources.cjs');
+const { SYNOPSIS_SOURCE_ID, ROLE_PROFILE_SOURCE_ID, synopsisText, roleText, unconfirmedAssumptionsText } = require('../shared/analysisSources.cjs');
+const { getAnalysisContext } = require('../shared/analysisScope.cjs');
 const { getCaseDir } = require('../shared/storage.cjs');
 const { createSerialLock } = require('../shared/serialLock.cjs');
 const { CodexAppServerClient, CodexAppServerError, buildCodexEnvironment } = require('./codexAppServer.cjs');
@@ -353,26 +354,29 @@ function noSecrets(message, key) {
   return text.slice(0, 500);
 }
 
-async function evidenceForRequest(caseRecord) {
+async function evidenceForRequest(caseRecord, includeRoleProfile) {
   let attachmentBytes = 0;
   let textCharacters = (caseRecord.synopsis || '').length;
   const rows = [];
   for (const item of caseRecord.evidence || []) {
+    // Fixed source IDs are supplied only by the app, according to their scope.
+    if (item.id === SYNOPSIS_SOURCE_ID || item.id === ROLE_PROFILE_SOURCE_ID) continue;
     const body = item.extractedText || '';
     textCharacters += body.length;
     const bytes = item.attachmentPath ? await fs.readFile(attachmentPath(caseRecord.id, item.attachmentPath)) : Buffer.alloc(0);
     attachmentBytes += bytes.length;
     rows.push({ item, bytes, text: body, fullPath: item.attachmentPath ? attachmentPath(caseRecord.id, item.attachmentPath) : '' });
   }
-  textCharacters += JSON.stringify(caseRecord.roleProfile || {}).length;
+  if (includeRoleProfile === true) textCharacters += JSON.stringify(caseRecord.roleProfile || {}).length;
   if (attachmentBytes > MAX_REQUEST_FILE_BYTES) throw new Error('資料の合計サイズが40MBを超えています。資料を分けるか、不要な添付を別シナリオへ移してください。資料は切り捨てていません。');
   if (textCharacters > MAX_ANALYSIS_TEXT_CHARS) throw new Error('解析対象テキストが30万文字を超えています。資料は切り捨てていません。要点を別シナリオに整理してから解析してください。');
   return { rows, attachmentBytes, textCharacters };
 }
 
-function currentActionsText(caseRecord) {
-  const current = (caseRecord.analysis && caseRecord.analysis.actions || []).filter((action) => action.status === 'active');
-  const rejected = (caseRecord.actionHistory || []).filter((action) => action.status === 'discarded');
+function currentActionsText(caseRecord, includeRoleProfile) {
+  const context = getAnalysisContext(caseRecord, includeRoleProfile).caseRecord;
+  const current = context.analysis.actions;
+  const rejected = context.actionHistory.filter((action) => action.status === 'discarded');
   return '\n\n[アプリが保持する現在の方針状態。資料としての根拠ではありません]\n有効方針: ' + JSON.stringify(current.map((a) => ({ id: a.id, title: a.title, step: a.step, priority: a.priority }))) + '\n手動棄却済み(再提案しない): ' + JSON.stringify(rejected.map((a) => ({ title: a.title }))) + '\n';
 }
 
@@ -388,7 +392,7 @@ async function openAiRequest(caseRecord, preferences, requestData) {
   const key = safeStorage.decryptString(encrypted);
   if (!key.trim()) throw new Error('OpenAI APIキーを設定してください。');
   const client = new OpenAI({ apiKey: key, timeout: 180000, maxRetries: 0 });
-  const instructions = SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile);
+  const instructions = SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord, preferences.includeRoleProfile) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile);
   const content = [{ type: 'input_text', text: synopsisText(caseRecord) }];
   for (const { item, bytes, text } of requestData.rows) {
     content.push({ type: 'input_text', text: renderEvidenceLabel(item) });
@@ -401,7 +405,7 @@ async function openAiRequest(caseRecord, preferences, requestData) {
       content.push({ type: 'input_text', text: text || '[テキスト本文は空です]' });
     }
   }
-  const active = (caseRecord.analysis && caseRecord.analysis.actions || []).filter((action) => action.status === 'active');
+  const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
   content.push({ type: 'input_text', text: '[更新対象: 現在有効な方針]\n' + JSON.stringify(active.map((a) => ({ id: a.id, title: a.title, step: a.step, rationale: a.rationale }))) });
   const result = await client.responses.create({
     model: preferences.model || 'gpt-6-luna',
@@ -422,7 +426,7 @@ async function openAiRequest(caseRecord, preferences, requestData) {
 async function ollamaRequest(caseRecord, preferences, requestData) {
   const endpoint = normalizeOllamaUrl(preferences.ollamaUrl);
   if (!preferences.ollamaModel || !preferences.ollamaModel.trim()) throw new Error('Ollamaモデル名を設定してください。');
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile) }];
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord, preferences.includeRoleProfile) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile) }];
   let userText = synopsisText(caseRecord);
   const images = [];
   for (const { item, bytes, text } of requestData.rows) {
@@ -431,7 +435,7 @@ async function ollamaRequest(caseRecord, preferences, requestData) {
     else if (item.kind === 'pdf' && !text.trim()) userText += '[このローカルモデル用にはPDF本文を抽出できませんでした。ページ画像も送っていません。]';
     else userText += text || '[本文なし]';
   }
-  const active = (caseRecord.analysis && caseRecord.analysis.actions || []).filter((action) => action.status === 'active');
+  const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
   userText += '\n\n[現在有効な方針ID]\n' + JSON.stringify(active.map((a) => ({ id: a.id, title: a.title, step: a.step, rationale: a.rationale })));
   messages.push({ role: 'user', content: userText, images });
   const response = await fetch(endpoint + '/api/chat', {
@@ -469,7 +473,7 @@ async function codexRequest(caseRecord, preferences, requestData, signal) {
     try {
       prepared = await prepareCodexInput(caseRecord, requestData, {
         signal,
-        contextText: [roleText(caseRecord, preferences.includeRoleProfile), currentActionsText(caseRecord), unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile)].join('\n\n')
+        contextText: [roleText(caseRecord, preferences.includeRoleProfile), currentActionsText(caseRecord, preferences.includeRoleProfile), unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile)].join('\n\n')
       });
       const instructions = buildCodexDeveloperInstructions(SYSTEM_PROMPT);
       const result = await client.runStructuredTurn({
@@ -508,7 +512,7 @@ async function analyzeCase(id, expectedRevision) {
   let requestData = { rows: [], attachmentBytes: 0, textCharacters: 0 };
   try {
     if (codexController && codexController.signal.aborted) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
-    requestData = await evidenceForRequest(started);
+    requestData = await evidenceForRequest(started, preferences.includeRoleProfile);
     if (codexController && codexController.signal.aborted) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
     const response = preferences.provider === 'openai'
       ? await openAiRequest(started, preferences, requestData)

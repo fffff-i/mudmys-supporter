@@ -1,5 +1,6 @@
 const { randomUUID } = require('node:crypto');
 const { getAnalysisSources, getFixedAnalysisSources } = require('./analysisSources.cjs');
+const { INPUT_PROVENANCE_VERSION, getAnalysisContext } = require('./analysisScope.cjs');
 
 function normalize(text) {
   return String(text || '').normalize('NFKC').toLowerCase().replace(/[\s、。！？!?・.,:：;；「」『』()（）]/g, '');
@@ -33,17 +34,21 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
 
   const evidenceById = new Map(getAnalysisSources(current, options).map((entry) => [entry.id, entry]));
   const evidenceIds = new Set(evidenceById.keys());
+  const context = getAnalysisContext(current, options.includeRoleProfile);
   const previous = current.analysis && current.analysis.actions ? current.analysis.actions : [];
   const oldById = new Map(previous.map((action) => [action.id, action]));
-  const activeIds = new Set(previous.filter((action) => action.status === 'active').map((action) => action.id));
+  const activeIds = new Set(context.activeActionIds);
+  const excludedIds = new Set(context.excludedActionIds);
   const seenDisposition = new Set();
-  // The existing action context can contain role-derived prose even when the
-  // profile itself is off. Keep the new hypothesis context conservative too.
-  // A request builder that filters that prose may explicitly supply false.
-  const previousContextMayIncludeRoleProfile = options.previousContextMayIncludeRoleProfile ?? Boolean(
-    (activeIds.size && (current.analysis?.grounding?.includeRoleProfile !== false || current.analysis?.grounding?.previousContextMayIncludeRoleProfile)) ||
-    (current.actionHistory || []).some((action) => action.status === 'discarded')
-  );
+  // These input conditions are app-owned; model output cannot clear them.
+  const grounding = {
+    version: INPUT_PROVENANCE_VERSION,
+    includeRoleProfile: options.includeRoleProfile === true,
+    previousContextMayIncludeRoleProfile: context.previousContextMayIncludeRoleProfile || options.previousContextMayIncludeRoleProfile === true,
+    evidenceIds: [...evidenceIds],
+    contextActionIds: context.activeActionIds,
+    contextHistoryActionIds: context.historyActionIds
+  };
 
   const validateRefs = (records, label, required = false) => {
     for (const record of records || []) {
@@ -65,7 +70,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
   };
   const hypotheses = (output.hypotheses || []).map((item) => ({
     ...item,
-    assumptions: assumptionsFor(item, (current.analysis?.hypotheses || []).find((old) => old.statement === item.statement)?.assumptions || [])
+    assumptions: assumptionsFor(item, (context.caseRecord.analysis.hypotheses || []).find((old) => old.statement === item.statement)?.assumptions || [])
   }));
   for (const action of output.actions || []) assumptionsFor(action);
   const events = (output.events || []).map((event) => {
@@ -106,7 +111,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
   }
   for (const id of activeIds) assert(seenDisposition.has(id), '既存方針の更新先が決まっていないため、前回結果を保持しました。');
 
-  const discarded = (current.actionHistory || []).filter((action) => action.status === 'discarded');
+  const discarded = context.caseRecord.actionHistory.filter((action) => action.status === 'discarded');
   for (const proposed of prepared) {
     const blocked = discarded.find((old) => similarity(proposed.title, old.title) >= 0.86);
     assert(!blocked, '手動で棄却した方針と同じ案が再提案されたため、前回結果を保持しました。');
@@ -129,6 +134,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       priority: action.priority,
       evidenceIds: action.evidenceIds,
       assumptions: assumptionsFor(action, inheritedAssumptions),
+      grounding,
       status: 'active',
       createdAt: old ? old.createdAt : generatedAt,
       updatedAt: generatedAt
@@ -144,6 +150,16 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
 
   const retireReason = new Map(retiredActions.map((item) => [item.actionId, item.reason]));
   for (const action of previous) {
+    if (excludedIds.has(action.id)) {
+      history.push({
+        ...action,
+        status: 'retired',
+        retiredAt: generatedAt,
+        retirementReason: '役情報の送信設定により今回の更新対象から除外。内容はこのPCの履歴に保持。',
+        replacedByActionId: null
+      });
+      continue;
+    }
     if (action.status !== 'active' || !seenDisposition.has(action.id)) continue;
     const replacementId = replacementOwners.get(action.id);
     const inferredOwner = assigned.find((candidate) => {
@@ -177,8 +193,11 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       actions: assigned.sort((a, b) => a.priority - b.priority),
       provider: output.provider || 'AI',
       sources: getFixedAnalysisSources(current, options),
-      grounding: { includeRoleProfile: options.includeRoleProfile === true, previousContextMayIncludeRoleProfile, evidenceIds: [...evidenceIds] }
+      grounding
     },
+    analysisHistory: context.excludedPreviousAnalysis
+      ? [...(current.analysisHistory || []), current.analysis]
+      : current.analysisHistory || [],
     actionHistory: history
   };
 }
@@ -222,6 +241,7 @@ function restoreAction(current, actionId, generatedAt = new Date().toISOString()
     priority: source.priority,
     evidenceIds: source.evidenceIds || [],
     assumptions: source.assumptions || [],
+    grounding: source.grounding,
     status: 'active',
     createdAt: generatedAt,
     updatedAt: generatedAt,
