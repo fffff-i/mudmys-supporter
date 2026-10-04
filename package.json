@@ -1,6 +1,6 @@
 {
   "name": "makua-mystery-notebook",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "シナリオ資料を根拠に状況と次の確認行動を整理するデスクトップノート",
   "main": "electron/main.cjs",
@@ -9,6 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "start": "electron .",
     "test": "node --test",
+    "test:ui": "node scripts/verifyScenarioDrafts.cjs && node scripts/verifyPdfSources.cjs && node scripts/verifyActionHistory.cjs && node scripts/verifyEvidenceIntake.cjs && node scripts/verifyAnalysisUpdates.cjs && node scripts/verifyPlayScreen.cjs",
+    "check": "npm test && npm run build && npm run test:ui",
     "package:portable": "npm run build && electron-builder --win portable"
   },
   "dependencies": {
@@ -33,7 +35,7 @@
     "appId": "jp.makua.mysterynotebook",
     "productName": "幕間ノート",
     "directories": {
-      "output": "release-v0.2.1"
+      "output": "release-v0.3.0"
     },
     "files": [
       "dist/**",

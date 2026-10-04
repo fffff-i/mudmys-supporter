@@ -1,65 +1,66 @@
 const { randomUUID } = require('node:crypto');
-
-function normalize(text) {
-  return String(text || '').normalize('NFKC').toLowerCase().replace(/[\s、。！？!?・.,:：;；「」『』()（）]/g, '');
-}
-
-function similarity(left, right) {
-  const a = normalize(left);
-  const b = normalize(right);
-  if (a === b) return 1;
-  if (!a || !b) return 0;
-  const row = Array.from({ length: b.length + 1 }, (_, index) => index);
-  for (let i = 1; i <= a.length; i += 1) {
-    let diagonal = row[0];
-    row[0] = i;
-    for (let j = 1; j <= b.length; j += 1) {
-      const above = row[j];
-      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
-      diagonal = above;
-    }
-  }
-  return 1 - row[b.length] / Math.max(a.length, b.length);
-}
+const { getAnalysisSources, getFixedAnalysisSources } = require('./analysisSources.cjs');
+const { enabledEvidence } = require('./evidence.mjs');
+const { INPUT_PROVENANCE_VERSION, getAnalysisContext, mayIncludeRoleProfile } = require('./analysisScope.cjs');
+const { similarity, sameActionIntent, prepareRechecks, coveredHistoryIds } = require('./actionHistory.cjs');
+const { verifyEventQuote } = require('./pdfSources.cjs');
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function applyAnalysis(current, output, expectedRevision, generatedAt = new Date().toISOString()) {
+function applyAnalysis(current, output, expectedRevision, generatedAt = new Date().toISOString(), options = {}) {
   assert(current.revision === expectedRevision, 'この解析より新しい変更があるため、結果を破棄しました。');
   assert(output && typeof output.overview === 'string', '解析結果の形式を確認できませんでした。');
 
-  const evidenceById = new Map((current.evidence || []).map((entry) => [entry.id, entry]));
+  const evidenceById = new Map(getAnalysisSources(current, options).map((entry) => [entry.id, entry]));
   const evidenceIds = new Set(evidenceById.keys());
+  const context = getAnalysisContext(current, options.includeRoleProfile);
   const previous = current.analysis && current.analysis.actions ? current.analysis.actions : [];
   const oldById = new Map(previous.map((action) => [action.id, action]));
-  const activeIds = new Set(previous.filter((action) => action.status === 'active').map((action) => action.id));
+  const activeIds = new Set(context.activeActionIds);
+  const excludedIds = new Set(context.excludedActionIds);
   const seenDisposition = new Set();
+  // These input conditions are app-owned; model output cannot clear them.
+  const grounding = {
+    version: INPUT_PROVENANCE_VERSION,
+    inputRevision: expectedRevision,
+    includeRoleProfile: options.includeRoleProfile === true,
+    previousContextMayIncludeRoleProfile: context.previousContextMayIncludeRoleProfile || options.previousContextMayIncludeRoleProfile === true,
+    evidenceIds: [...new Set([...evidenceIds, ...context.contextEvidenceIds])],
+    evidenceOriginUnknown: context.evidenceOriginUnknown,
+    contextActionIds: context.activeActionIds,
+    contextHistoryActionIds: context.historyActionIds
+  };
+  const sourceSnapshots = [...getFixedAnalysisSources(current, options), ...getAnalysisSources(current, options).filter((source) => !source.id.startsWith('scenario:'))].map((source) => ({ ...source }));
 
-  const validateRefs = (records, label) => {
+  const validateRefs = (records, label, required = false) => {
     for (const record of records || []) {
       assert(Array.isArray(record.evidenceIds), label + 'に根拠IDがありません。');
-      for (const id of record.evidenceIds) assert(evidenceIds.has(id), '存在しない資料IDが解析結果に含まれました。');
+      if (required) assert(record.evidenceIds.length > 0, '事実には実在する出典が必要です。');
+      for (const id of record.evidenceIds) assert(typeof id === 'string' && evidenceIds.has(id), '存在しない資料IDまたは今回送信していない出典IDが解析結果に含まれました。');
     }
   };
   validateRefs(output.flow, '流れ');
-  validateRefs(output.facts, '事実');
+  validateRefs(output.facts, '事実', true);
   validateRefs(output.hypotheses, '仮説');
   validateRefs(output.unknowns, '未確認事項');
   validateRefs(output.actions, '方針');
+  const assumptionsFor = (record, fallback = []) => {
+    // Legacy results omit this field. Newly generated output always supplies it.
+    const assumptions = record.assumptions === undefined ? fallback : record.assumptions;
+    assert(Array.isArray(assumptions) && assumptions.every((value) => typeof value === 'string' && value.trim()), '仮定は未確認の条件を表す文字列の配列にしてください。');
+    return assumptions.map((value) => value.trim());
+  };
+  const hypotheses = (output.hypotheses || []).map((item) => ({
+    ...item,
+    assumptions: assumptionsFor(item, (context.caseRecord.analysis.hypotheses || []).find((old) => old.statement === item.statement)?.assumptions || [])
+  }));
+  for (const action of output.actions || []) assumptionsFor(action);
   const events = (output.events || []).map((event) => {
     const source = evidenceById.get(event.sourceId);
     assert(source, 'イベントに存在しない資料IDが含まれました。');
-    let quoteOrigin = source.kind === 'image' ? '画像からの読取（原文一致は未検証）' : 'PDF画像からの読取（原文一致は未検証）';
-    if ((source.kind === 'text' || source.kind === 'pdf') && source.extractedText && source.extractionStatus !== 'no_text') {
-      const normalizeSpaces = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-      const quote = normalizeSpaces(event.quote);
-      const original = normalizeSpaces(source.extractedText);
-      assert(quote && original.includes(quote), '資料の原文に一致しないイベント引用があったため、前回結果を保持しました。');
-      quoteOrigin = 'テキスト抽出と原文一致';
-    }
-    return { ...event, quoteOrigin };
+    return verifyEventQuote(event, source, options.sourceInputs?.[source.id]);
   });
 
   const retiredActions = Array.isArray(output.retirements) ? output.retirements : [];
@@ -86,15 +87,23 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
   }
   for (const id of activeIds) assert(seenDisposition.has(id), '既存方針の更新先が決まっていないため、前回結果を保持しました。');
 
-  const discarded = (current.actionHistory || []).filter((action) => action.status === 'discarded');
-  for (const proposed of prepared) {
-    const blocked = discarded.find((old) => similarity(proposed.title, old.title) >= 0.86);
-    assert(!blocked, '手動で棄却した方針と同じ案が再提案されたため、前回結果を保持しました。');
-  }
+  const terminalHistory = context.caseRecord.actionHistory.filter((action) => ['completed', 'discarded'].includes(action.status));
+  const rechecks = prepared.map((action) => {
+    const inherited = [...new Set([...(action.continuesActionIds || []), ...(action.replacesActionIds || [])])]
+      .flatMap((id) => oldById.get(id)?.rechecks || []);
+    return prepareRechecks(action, terminalHistory, inherited);
+  });
+  prepared.forEach((proposed, index) => {
+    const covered = coveredHistoryIds(rechecks[index], terminalHistory);
+    const blocked = terminalHistory.find((old) => sameActionIntent(proposed, old) && !covered.has(old.id));
+    assert(!blocked, '完了または手動で棄却（見送り）した行動と同じ案が、前提の違いを示さず再提案されたため、前回結果を保持しました。');
+  });
 
-  const assigned = prepared.map((action) => {
+  const assigned = prepared.map((action, index) => {
     const continuedId = (action.continuesActionIds || [])[0];
     const old = continuedId ? oldById.get(continuedId) : null;
+    const inheritedAssumptions = [...new Set([...(action.continuesActionIds || []), ...(action.replacesActionIds || [])]
+      .flatMap((id) => oldById.get(id)?.assumptions || []))];
     return {
       id: old ? old.id : randomUUID(),
       title: action.title,
@@ -106,6 +115,10 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       rationale: action.rationale,
       priority: action.priority,
       evidenceIds: action.evidenceIds,
+      assumptions: assumptionsFor(action, inheritedAssumptions),
+      rechecks: rechecks[index],
+      grounding,
+      sourceSnapshots: sourceSnapshots.filter((source) => action.evidenceIds.includes(source.id)),
       status: 'active',
       createdAt: old ? old.createdAt : generatedAt,
       updatedAt: generatedAt
@@ -121,6 +134,17 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
 
   const retireReason = new Map(retiredActions.map((item) => [item.actionId, item.reason]));
   for (const action of previous) {
+    if (excludedIds.has(action.id)) {
+      history.push({
+        ...action,
+        status: 'retired',
+        retiredAt: generatedAt,
+        retirementReason: '資料・役情報の送信設定により今回の更新対象から除外。内容はこのPCの履歴に保持。',
+        retirementGrounding: grounding,
+        replacedByActionId: null
+      });
+      continue;
+    }
     if (action.status !== 'active' || !seenDisposition.has(action.id)) continue;
     const replacementId = replacementOwners.get(action.id);
     const inferredOwner = assigned.find((candidate) => {
@@ -133,6 +157,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       status: 'retired',
       retiredAt: generatedAt,
       retirementReason: retireReason.get(action.id) || (replacementId ? '新しい方針へ置き換え' : '解析結果を受けて優先対象から外れた'),
+      retirementGrounding: grounding,
       replacedByActionId: replacementId || null
     });
   }
@@ -149,33 +174,81 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       flow: output.flow || [],
       events,
       facts: output.facts || [],
-      hypotheses: output.hypotheses || [],
+      hypotheses,
       unknowns: output.unknowns || [],
       actions: assigned.sort((a, b) => a.priority - b.priority),
-      provider: output.provider || 'AI'
+      provider: output.provider || 'AI',
+      sources: sourceSnapshots,
+      grounding
     },
+    analysisHistory: context.excludedPreviousAnalysis
+      ? [...(current.analysisHistory || []), current.analysis]
+      : current.analysisHistory || [],
     actionHistory: history
   };
 }
 
-function discardAction(current, actionId, reason, generatedAt = new Date().toISOString()) {
-  const actions = current.analysis && current.analysis.actions ? current.analysis.actions : [];
+function manualNoteGrounding(action, options = {}, previousGrounding) {
+  const origins = [action.grounding, previousGrounding].filter(Boolean);
+  return {
+    version: INPUT_PROVENANCE_VERSION,
+    includeRoleProfile: options.includeRoleProfile === true,
+    previousContextMayIncludeRoleProfile: mayIncludeRoleProfile(action.grounding) ||
+      Boolean(previousGrounding && mayIncludeRoleProfile(previousGrounding)),
+    evidenceIds: [...new Set([...origins.flatMap((origin) => origin.evidenceIds || []), ...(options.evidenceIds || [])])],
+    evidenceOriginUnknown: !action.grounding || origins.some((origin) => origin.version !== INPUT_PROVENANCE_VERSION ||
+      !Array.isArray(origin.evidenceIds) || origin.evidenceOriginUnknown === true),
+    contextActionIds: [action.id], contextHistoryActionIds: [action.id]
+  };
+}
+
+function retireManually(current, actionId, status, reason, generatedAt, options) {
+  const actions = current.analysis?.actions || [];
   const selected = actions.find((action) => action.id === actionId && action.status === 'active');
+  if (!selected && (current.actionHistory || []).some((action) => action.id === actionId && action.status === status)) return current;
   assert(selected, '現在有効な方針を選んでください。');
-  assert(String(reason || '').trim().length >= 2, '棄却理由を入力してください。');
+  assert(reason === undefined || typeof reason === 'string', '任意の理由は文章で入力してください。');
+  const text = (reason || '').trim();
   return {
     ...current,
-    revision: current.revision + 1,
-    updatedAt: generatedAt,
+    revision: current.revision + 1, updatedAt: generatedAt,
     analysis: { ...current.analysis, actions: actions.filter((action) => action.id !== actionId) },
     actionHistory: [...(current.actionHistory || []), {
-      ...selected,
-      status: 'discarded',
-      retiredAt: generatedAt,
-      retirementReason: String(reason).trim(),
+      ...selected, status, retiredAt: generatedAt, retirementReason: text,
+      retirementGrounding: text ? manualNoteGrounding(selected, { ...options, evidenceIds: enabledEvidence(current).map((item) => item.id) }) : selected.grounding,
       replacedByActionId: null
     }]
   };
+}
+
+function completeAction(current, actionId, generatedAt = new Date().toISOString(), options = {}) {
+  return retireManually(current, actionId, 'completed', '', generatedAt, options);
+}
+
+function discardAction(current, actionId, reason = '', generatedAt = new Date().toISOString(), options = {}) {
+  return retireManually(current, actionId, 'discarded', reason, generatedAt, options);
+}
+
+function updateActionNotes(current, actionId, notes, generatedAt = new Date().toISOString(), options = {}) {
+  const history = [...(current.actionHistory || [])];
+  const index = history.findLastIndex((action) => action.id === actionId);
+  assert(index >= 0, 'メモを保存する行動履歴がありません。');
+  assert(notes && typeof notes === 'object', '履歴メモを確認できませんでした。');
+  const source = history[index];
+  const updated = { ...source };
+  for (const [input, textField, provenanceField] of [
+    ['reason', 'retirementReason', 'retirementGrounding'], ['resultNote', 'resultNote', 'resultGrounding']
+  ]) {
+    if (notes[input] === undefined) continue;
+    assert(typeof notes[input] === 'string', '任意の理由・回答は文章で入力してください。');
+    updated[textField] = notes[input].trim();
+    // An edited note keeps the provenance of the prose it replaces as well.
+    const previous = source[textField] ? source[provenanceField] || { includeRoleProfile: true } : undefined;
+    updated[provenanceField] = manualNoteGrounding(source, { ...options, evidenceIds: enabledEvidence(current).map((item) => item.id) }, previous);
+  }
+  updated.notesUpdatedAt = generatedAt;
+  history[index] = updated;
+  return { ...current, revision: current.revision + 1, updatedAt: generatedAt, actionHistory: history };
 }
 
 function restoreAction(current, actionId, generatedAt = new Date().toISOString()) {
@@ -196,6 +269,10 @@ function restoreAction(current, actionId, generatedAt = new Date().toISOString()
     rationale: source.rationale,
     priority: source.priority,
     evidenceIds: source.evidenceIds || [],
+    assumptions: source.assumptions || [],
+    rechecks: source.rechecks || [],
+    grounding: source.grounding,
+    sourceSnapshots: source.sourceSnapshots,
     status: 'active',
     createdAt: generatedAt,
     updatedAt: generatedAt,
@@ -210,4 +287,4 @@ function restoreAction(current, actionId, generatedAt = new Date().toISOString()
   };
 }
 
-module.exports = { applyAnalysis, discardAction, restoreAction, similarity };
+module.exports = { applyAnalysis, completeAction, discardAction, updateActionNotes, restoreAction, similarity };

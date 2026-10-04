@@ -5,11 +5,18 @@ const os = require('node:os');
 const { execFileSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const OpenAI = require('openai').default;
-const { applyAnalysis, discardAction, restoreAction } = require('../shared/analysisLifecycle.cjs');
+const { applyAnalysis, completeAction, discardAction, updateActionNotes, restoreAction } = require('../shared/analysisLifecycle.cjs');
+const { SYNOPSIS_SOURCE_ID, ROLE_PROFILE_SOURCE_ID, synopsisText, roleText, unconfirmedAssumptionsText } = require('../shared/analysisSources.cjs');
+const { getAnalysisContext } = require('../shared/analysisScope.cjs');
+const { actionContextText } = require('../shared/actionHistory.cjs');
 const { getCaseDir } = require('../shared/storage.cjs');
 const { createSerialLock } = require('../shared/serialLock.cjs');
+const { analysisSettingsKey, canAnalyze } = require('../shared/analysisUpdater.mjs');
 const { CodexAppServerClient, CodexAppServerError, buildCodexEnvironment } = require('./codexAppServer.cjs');
 const { prepareCodexInput, cleanupCodexInput, buildCodexDeveloperInstructions, parseStructuredResult } = require('./codexInput.cjs');
+const { extractPdfDocument, renderPdfPage } = require('./pdfDocuments.cjs');
+const { hasPdfMetadata, parsePdfPage, pdfTextForInput, evidenceTextForInput, sourceInputsForRows } = require('../shared/pdfSources.cjs');
+const { enabledEvidence, evidenceBody, inferEvidenceTitle, evidenceUsage } = require('../shared/evidence.mjs');
 const { accountEligibility, sanitizeCodexModels, chooseCodexModel, chooseCodexEffort, codexModelSupportsImages, summarizeRateLimits } = require('../shared/codexProvider.cjs');
 
 app.setName('幕間ノート');
@@ -23,13 +30,17 @@ const MAX_REQUEST_FILE_BYTES = 40 * 1024 * 1024;
 const MAX_ANALYSIS_TEXT_CHARS = 300000;
 const withCaseLock = createSerialLock();
 const withCodexTurnLock = createSerialLock();
+const withSettingsLock = createSerialLock();
+let settingsGeneration = 0;
+let settingsSavePending = 0;
 let mainWindow;
 let codexClient = null;
 let codexClientExecutable = '';
 let codexWorkspace = '';
 let pendingCodexLoginId = '';
 let closingCodexForQuit = false;
-const activeCodexAnalyses = new Map();
+const activeAnalyses = new Map();
+const stagedFiles = new Map();
 
 const ANALYSIS_SCHEMA = {
   type: 'object',
@@ -38,11 +49,11 @@ const ANALYSIS_SCHEMA = {
   properties: {
     overview: { type: 'string' },
     flow: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['moment', 'summary', 'evidenceIds'], properties: { moment: { type: 'string' }, summary: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
-    events: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['timeText', 'people', 'what', 'type', 'sourceId', 'page', 'quote', 'ambiguity'], properties: { timeText: { type: 'string' }, people: { type: 'array', items: { type: 'string' } }, what: { type: 'string' }, type: { type: 'string', enum: ['observed', 'reported', 'statement', 'recorded', 'inference', 'unknown'] }, sourceId: { type: 'string' }, page: { type: 'string' }, quote: { type: 'string' }, ambiguity: { type: 'string' } } } },
-    facts: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'evidenceIds'], properties: { statement: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
-    hypotheses: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'why', 'evidenceIds'], properties: { statement: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
+    events: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['timeText', 'people', 'what', 'type', 'sourceId', 'page', 'quote', 'quoteSource', 'ambiguity'], properties: { timeText: { type: 'string' }, people: { type: 'array', items: { type: 'string' } }, what: { type: 'string' }, type: { type: 'string', enum: ['observed', 'reported', 'statement', 'recorded', 'inference', 'unknown'] }, sourceId: { type: 'string' }, page: { type: 'string', description: 'PDFは原本の物理ページ番号を1始まりの数字で指定。その他は空文字。' }, quote: { type: 'string' }, quoteSource: { type: 'string', enum: ['text', 'image', 'edited'], description: '抽出本文の引用はtext、画像領域はimage、利用者が編集した本文はedited。照合状態はアプリが決定する。' }, ambiguity: { type: 'string' } } } },
+    facts: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'evidenceIds'], properties: { statement: { type: 'string' }, evidenceIds: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 }, description: '今回送信された実在する出典。事実は出典を1件以上必要とする。' } } } },
+    hypotheses: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'why', 'evidenceIds', 'assumptions'], properties: { statement: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '想定した未公開情報など、未確認の条件。条件がなければ空配列。' } } } },
     unknowns: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['question', 'why', 'evidenceIds'], properties: { question: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
-    actions: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['title', 'who', 'step', 'suggestedLine', 'purpose', 'secretRisk', 'rationale', 'priority', 'evidenceIds', 'continuesActionIds', 'replacesActionIds'], properties: { title: { type: 'string' }, who: { type: 'string' }, step: { type: 'string' }, suggestedLine: { type: 'string' }, purpose: { type: 'string' }, secretRisk: { type: 'string' }, rationale: { type: 'string' }, priority: { type: 'integer' }, evidenceIds: { type: 'array', items: { type: 'string' } }, continuesActionIds: { type: 'array', items: { type: 'string' } }, replacesActionIds: { type: 'array', items: { type: 'string' } } } } },
+    actions: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['title', 'who', 'step', 'suggestedLine', 'purpose', 'secretRisk', 'rationale', 'priority', 'evidenceIds', 'assumptions', 'continuesActionIds', 'replacesActionIds', 'rechecks'], properties: { title: { type: 'string' }, who: { type: 'string' }, step: { type: 'string' }, suggestedLine: { type: 'string' }, purpose: { type: 'string' }, secretRisk: { type: 'string' }, rationale: { type: 'string' }, priority: { type: 'integer' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '行動が依存する未確認の条件。単なる確認行動には条件を作らず空配列にする。' }, continuesActionIds: { type: 'array', items: { type: 'string' } }, replacesActionIds: { type: 'array', items: { type: 'string' } }, rechecks: { type: 'array', description: '完了・見送りを新しい前提で再確認する場合だけ、元履歴IDと具体的な前提の違いを示す。通常は空配列。', items: { type: 'object', additionalProperties: false, required: ['actionId', 'previousPremise', 'currentPremise', 'reason'], properties: { actionId: { type: 'string', minLength: 1 }, previousPremise: { type: 'string', minLength: 1 }, currentPremise: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } } } } } } },
     retirements: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['actionId', 'reason'], properties: { actionId: { type: 'string' }, reason: { type: 'string' } } } }
   }
 };
@@ -53,11 +64,17 @@ const SYSTEM_PROMPT = [
   '根拠に使えるのは、今回渡された資料IDと内容だけです。外部サイトを検索せず、既知シナリオの正解・犯人・秘密を補いません。',
   '直接資料に書かれた/見える内容を事実、読み取りや解釈を仮説、まだ決められない点を未確認事項に分けます。確率や犯人らしさの数値は出しません。公開範囲（全体公開・自分だけ・不明）は、事実/仮説/未確認と別の情報として扱います。',
   'イベント列では、元の資料の粒度を保って時刻表現、誰が/誰と、何があった/何を話したかを記録します。原文の時間表現をそのまま残し、「8時前」「夕方」「その後」等を勝手に正規化しない。同じ人物か不明な呼称を統合しない。主語省略、伝聞と直接観察、否定、期間や順序の曖昧さを勝手に補わない。各イベントに資料ID、ページ番号（不明なら空文字）、短い原文引用、曖昧な点を入れます。叙述トリックと断定せず「確認が必要な曖昧点」として扱います。',
+  'PDF引用のpageには原本の物理ページ番号を1始まりの数字だけで必ず入れます。印刷されたページラベルとは区別し、複数ページや不明なページを指定しません。テキスト資料・単独画像のpageは空文字です。利用者が編集した本文の引用はquoteSourceをeditedにし、pageは空文字にします。編集本文を原本の照合済み引用と扱いません。その他のquoteSourceは抽出本文の引用ならtext、抽出に含まれない画像領域を読んだ引用ならimageです。同じページの本文と画像も区別します。textの引用は該当ページの抽出原文をそのまま使い、不一致をimageへ変更して回避しません。PDFページ画像を送っていない接続先ではPDFのimage引用を作りません。照合済みかどうかは申告せず、アプリの検証に任せます。',
   '証言の存在と証言内容の真偽を分けます。例「Xが20時にAにいたと発言した」は発言としての事実ですが、「Xが20時にAにいた」は独立した裏付けがない限り事実ではありません。事実欄には「Xがそう発言した」と記し、発言内容そのものは仮説/未確認のままにします。',
-  'ユーザーが自分の役・目的を入力していれば、その目的達成に役立つ行動を優先します。未入力なら、役柄や目的を推測せず、必要なら確認を促します。秘密を不用意に開示しないよう、行動ごとに秘密が漏れるリスクを短く示します。',
-  '各方針は次に取る具体的行動の順番です。誰へ何を聞く/発言するか、質問または短い発言例、目的への寄与、根拠資料IDを含めます。資料にない人物名を作らないでください。',
-  '根拠IDは今回渡された資料IDを一字一句そのまま使ってください。根拠資料のない事実・仮説・行動を作らず、資料IDを推測しません。',
-  '現在の有効方針のIDはローカルアプリが管理します。継続する方針は continuesActionIds、新しい案に置き換える方針は replacesActionIds に置き、不要な方針は retirements に理由を付けます。各既存方針IDはこのいずれかにちょうど1回だけ含めてください。手動で棄却された方針は再提案しません。',
+  '送信されたHO（ハンドアウト）に役・目的が書かれていれば読み取って利用し、別欄への再入力を前提にしません。役プロフィールは任意の補足です。どちらにもなければ役柄や目的を決めつけず、一般的な確認行動を提案します。秘密を不用意に開示しないよう、行動ごとに秘密が漏れるリスクを短く示します。',
+  '各方針は次に取る具体的行動の順番です。誰へ何を聞く/発言するか、質問または短い発言例、目的への寄与を含めます。未公開の鍵・別の出入口・協力者などを一般的な可能性として想定できますが、資料にない人物名を登場人物として作らず「鍵の管理者」「協力者がいるなら」等と表現します。',
+  '事実のevidenceIdsには今回送信された実在する出典IDを1件以上必ず入れます。仮説・行動のevidenceIdsは任意で、根拠がなければ空配列にします。参照するIDは資料IDを一字一句そのまま使い、推測しません。概要・役プロフィールは資料IDが付いて送信された場合だけその固定出典IDを使えます。未入力・送信対象外のプロフィールは参照できません。',
+  '仮説・行動で未公開情報の存在を想定する場合、assumptionsに未確認の条件を短く記録し、本文も「別の出入口があるなら」のように条件付きにします。条件がなければ空配列にし、単なる確認行動に前提を無理に付けません。利用者に分類・根拠登録・前提の手入力や確認操作を求めません。',
+  '次回更新でも前回の仮説・行動のassumptionsは未確認の条件です。新資料に直接の裏付けがあるか見直し、確認されない条件は保持します。事実へ移すには、その条件を直接裏付ける今回の実在する出典が必要です。以前のAI出力や提案の繰り返し、関連資料のIDが付いているだけでは裏付けになりません。資料にないシナリオの正解を事実として補完しません。',
+  '現在の有効方針のIDはローカルアプリが管理します。継続する方針は continuesActionIds、新しい案に置き換える方針は replacesActionIds に置き、不要な方針は retirements に理由を付けます。各既存方針IDはこのいずれかにちょうど1回だけ含めてください。完了・見送りの履歴は通常の再提案をしません。',
+  '履歴のid・相手(who)・目的(purpose)・手順(step/suggestedLine)・未確認の前提(assumptions)・日時・任意の理由/回答を参照し、見出しを言い換えた同じ確認行動も完了・見送りとして扱います。履歴の理由や回答メモ自体は事実の出典ではありません。回答未入力や理由未入力で確認操作を求めず、入力されている理由も尊重します。',
+  '新しい前提により完了・見送りの行動を再確認する場合だけrechecksを付けます。actionIdは今回送られた元履歴ID、previousPremiseは元の前提・理由・手順にある短い原文、currentPremiseは今回の具体的な変化、reasonは再確認が必要な理由です。単なる見出しの変更・言い換え・関連資料IDの追加を前提の変化にしません。新しい前提が未確認ならassumptionsにも条件として示します。根拠資料は任意です。継続・置換した再確認の説明は保持します。通常の行動のrechecksは空配列です。',
+  '根拠資料の公開範囲と提案文の秘密漏洩リスクは別です。公開資料が根拠でも安全に発言できるとは扱わず、secretRiskには発言前に守る秘密や注意を短く示します。根拠のない確認行動を全体公開と推定しません。',
   '出力は指定JSONスキーマに従ってください。',
 ].join('\n');
 
@@ -140,11 +157,13 @@ async function stopCodexClient() {
   }
 }
 
-async function getCodexClient(preferredPath) {
+async function getCodexClient(preferredPath, requestingRun) {
   const executable = await findCodexExecutable(preferredPath);
   if (codexClient && !codexClient.closed && codexClientExecutable === executable) return codexClient;
   if (codexClient) {
-    if (activeCodexAnalyses.size || pendingCodexLoginId) {
+    // The requesting run owns the Codex turn lock; other Map entries may only
+    // be waiting. It must not block its own replacement of an idle old client.
+    if ((!requestingRun && [...activeAnalyses.values()].some((run) => run.provider === 'codex')) || pendingCodexLoginId) {
       throw new CodexAppServerError('Codex解析またはサインイン中はCLIの場所を変更できません。完了後にもう一度お試しください。', 'CODEX_BUSY');
     }
     await stopCodexClient();
@@ -233,12 +252,20 @@ async function readCase(id) {
   return JSON.parse(content);
 }
 
-async function writeCase(record) {
+async function writeCase(record, beforeCommit = () => {}) {
   const directory = casePath(record.id);
   await fs.mkdir(directory, { recursive: true });
   const temporary = path.join(directory, 'case.json.tmp-' + randomUUID());
-  await fs.writeFile(temporary, JSON.stringify(record, null, 2), 'utf8');
-  await fs.rename(temporary, path.join(directory, 'case.json'));
+  try {
+    await fs.writeFile(temporary, JSON.stringify(record, null, 2), 'utf8');
+    for (let attempt = 0; ; attempt++) {
+      try { beforeCommit(); await fs.rename(temporary, path.join(directory, 'case.json')); break; }
+      catch (error) {
+        if (process.platform !== 'win32' || !['EPERM', 'EBUSY'].includes(error.code) || attempt >= 3) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+      }
+    }
+  } finally { await fs.rm(temporary, { force: true }); }
 }
 
 async function mutateCase(id, mutate) {
@@ -265,29 +292,14 @@ function detectFileType(filePath) {
   return null;
 }
 
-async function extractPdfText(buffer) {
-  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-  const task = pdfjs.getDocument({ data: new Uint8Array(buffer), isEvalSupported: false, useSystemFonts: true, verbosity: 0 });
-  const pdf = await task.promise;
-  const pages = [];
-  const pageCount = pdf.numPages;
-  for (let number = 1; number <= pageCount; number += 1) {
-    const page = await pdf.getPage(number);
-    const content = await page.getTextContent();
-    const text = content.items.map((item) => (item && typeof item.str === 'string' ? item.str : '')).filter(Boolean).join(' ');
-    if (text.trim()) pages.push('[p.' + number + '] ' + text);
-  }
-  await task.destroy();
-  return { text: pages.join('\n\n'), pages: pageCount };
-}
-
-async function storeEvidence(caseRecord, bytes, originalName, kind, mimeType, extractedText, extractionStatus, extractionMessage) {
+async function storeEvidence(caseRecord, bytes, originalName, kind, mimeType, extractedText, extractionStatus, extractionMessage, pdfMetadata = {}, writtenPaths = []) {
   const id = randomUUID();
   const fileName = safeName(originalName);
   const relativePath = path.join('attachments', id + '_' + fileName);
   const fullPath = path.join(casePath(caseRecord.id), relativePath);
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
-  await fs.writeFile(fullPath, bytes);
+  writtenPaths.push(fullPath);
+  await fs.writeFile(fullPath, bytes, { flag: 'wx' });
   return {
     id,
     title: fileName,
@@ -300,7 +312,8 @@ async function storeEvidence(caseRecord, bytes, originalName, kind, mimeType, ex
     extractionMessage: extractionMessage || '',
     byteSize: bytes.length,
     visibility: 'unknown',
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    ...pdfMetadata
   };
 }
 
@@ -324,6 +337,7 @@ async function publicPreferences() {
     codexModel: value.codexModel || '',
     codexEffort: value.codexEffort || '',
     codexCliPath: value.codexCliPath || '',
+    settingsVersion: settingsGeneration,
     autoUpdate: Boolean(value.autoUpdate),
     includeRoleProfile: Boolean(value.includeRoleProfile),
     cloudConsent: Boolean(value.cloudConsent),
@@ -350,33 +364,33 @@ function noSecrets(message, key) {
   return text.slice(0, 500);
 }
 
-async function evidenceForRequest(caseRecord) {
+async function evidenceForRequest(caseRecord, includeRoleProfile, provider) {
   let attachmentBytes = 0;
-  let textCharacters = (caseRecord.synopsis || '').length;
   const rows = [];
-  for (const item of caseRecord.evidence || []) {
-    const body = item.extractedText || '';
-    textCharacters += body.length;
-    const bytes = item.attachmentPath ? await fs.readFile(attachmentPath(caseRecord.id, item.attachmentPath)) : Buffer.alloc(0);
+  for (const savedItem of enabledEvidence(caseRecord)) {
+    let item = savedItem;
+    // Fixed sources are supplied only by the app, according to their scope.
+    if (item.id === SYNOPSIS_SOURCE_ID || item.id === ROLE_PROFILE_SOURCE_ID) continue;
+    let bytes;
+    try { bytes = item.attachmentPath && item.kind !== 'text' ? await fs.readFile(attachmentPath(caseRecord.id, item.attachmentPath)) : Buffer.alloc(0); }
+    catch { throw new Error('「' + item.title + '」の原本を読み取れません。保存済みの本文と前回結果は保持しています。'); }
+    if (item.kind === 'pdf' && !hasPdfMetadata(item) && bytes.length) {
+      const metadata = await extractPdfDocument(bytes);
+      item = { ...item, ...metadata, extractedText: metadata.extractedText || item.extractedText || '' };
+    }
+    if ((item.kind === 'pdf' || item.kind === 'image') && !bytes.length) throw new Error('「' + item.title + '」の原本がありません。保存済みの本文と前回結果は保持しています。');
+    const body = evidenceBody(item);
     attachmentBytes += bytes.length;
     rows.push({ item, bytes, text: body, fullPath: item.attachmentPath ? attachmentPath(caseRecord.id, item.attachmentPath) : '' });
   }
-  textCharacters += JSON.stringify(caseRecord.roleProfile || {}).length;
-  if (attachmentBytes > MAX_REQUEST_FILE_BYTES) throw new Error('資料の合計サイズが40MBを超えています。資料を分けるか、不要な添付を別シナリオへ移してください。資料は切り捨てていません。');
-  if (textCharacters > MAX_ANALYSIS_TEXT_CHARS) throw new Error('解析対象テキストが30万文字を超えています。資料は切り捨てていません。要点を別シナリオに整理してから解析してください。');
+  const textCharacters = evidenceUsage({ ...caseRecord, evidence: rows.map(({ item }) => item) }, includeRoleProfile).textCharacters;
+  if (attachmentBytes > MAX_REQUEST_FILE_BYTES) throw new Error('解析対象の添付が40MiBを超えています。資料一覧で不要な資料を解析対象から外すと、同じシナリオで再開できます。原本は保持しています。');
+  if (textCharacters > MAX_ANALYSIS_TEXT_CHARS) throw new Error('解析対象の本文が30万文字を超えています。資料一覧で本文を編集するか資料を解析対象から外すと、同じシナリオで再開できます。原本は保持しています。');
   return { rows, attachmentBytes, textCharacters };
 }
 
-function currentActionsText(caseRecord) {
-  const current = (caseRecord.analysis && caseRecord.analysis.actions || []).filter((action) => action.status === 'active');
-  const rejected = (caseRecord.actionHistory || []).filter((action) => action.status === 'discarded');
-  return '\n\n[アプリが保持する現在の方針状態。資料としての根拠ではありません]\n有効方針: ' + JSON.stringify(current.map((a) => ({ id: a.id, title: a.title, step: a.step, priority: a.priority }))) + '\n手動棄却済み(再提案しない): ' + JSON.stringify(rejected.map((a) => ({ title: a.title }))) + '\n';
-}
-
-function roleText(caseRecord, includeRoleProfile) {
-  if (!includeRoleProfile) return '[役・目的・秘密: 今回の解析には含めない]';
-  const role = caseRecord.roleProfile || {};
-  return '[プレイヤー自身の役・目的・秘密。資料の公開範囲とは別の情報です]\n役: ' + (role.role || '未入力') + '\n目的: ' + (role.goal || '未入力') + '\n秘密: ' + (role.secret || '未入力');
+function currentActionsText(caseRecord, includeRoleProfile) {
+  return actionContextText(caseRecord, includeRoleProfile);
 }
 
 function renderEvidenceLabel(item) {
@@ -384,28 +398,30 @@ function renderEvidenceLabel(item) {
   return '[資料ID: ' + item.id + '] [' + visibility + '] [' + (item.kind === 'image' ? '画像' : item.kind === 'pdf' ? 'PDF' : 'テキスト') + '] ' + item.title;
 }
 
-async function openAiRequest(caseRecord, preferences, requestData) {
+async function openAiRequest(caseRecord, preferences, requestData, run) {
   if (!preferences.cloudConsent) throw new Error('OpenAIへ資料を送る設定がオフです。設定画面で送信範囲を確認してから有効にしてください。');
   if (!safeStorage.isEncryptionAvailable()) throw new Error('このWindows環境で暗号化ストレージが利用できません。APIキーを保存できないためOpenAI接続を停止しました。');
   const encrypted = await fs.readFile(KEY_FILE);
   const key = safeStorage.decryptString(encrypted);
   if (!key.trim()) throw new Error('OpenAI APIキーを設定してください。');
   const client = new OpenAI({ apiKey: key, timeout: 180000, maxRetries: 0 });
-  const instructions = SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord);
-  const content = [{ type: 'input_text', text: '[シナリオ概要]\n' + (caseRecord.synopsis || '概要未入力') }];
+  const instructions = SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord, preferences.includeRoleProfile) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile);
+  const content = [{ type: 'input_text', text: synopsisText(caseRecord) }];
   for (const { item, bytes, text } of requestData.rows) {
     content.push({ type: 'input_text', text: renderEvidenceLabel(item) });
     if (item.kind === 'pdf') {
       content.push({ type: 'input_file', filename: safeName(item.originalName), file_data: 'data:application/pdf;base64,' + bytes.toString('base64'), detail: 'auto' });
-      if (text) content.push({ type: 'input_text', text: '[このPDFからローカル抽出したテキスト]\n' + text });
+      content.push({ type: 'input_text', text: pdfTextForInput(item, true) });
     } else if (item.kind === 'image') {
       content.push({ type: 'input_image', image_url: 'data:' + item.mimeType + ';base64,' + bytes.toString('base64'), detail: 'auto' });
+      if (typeof item.editedText === 'string') content.push({ type: 'input_text', text: evidenceTextForInput(item) });
     } else {
-      content.push({ type: 'input_text', text: text || '[テキスト本文は空です]' });
+      content.push({ type: 'input_text', text: evidenceTextForInput(item) });
     }
   }
-  const active = (caseRecord.analysis && caseRecord.analysis.actions || []).filter((action) => action.status === 'active');
+  const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
   content.push({ type: 'input_text', text: '[更新対象: 現在有効な方針]\n' + JSON.stringify(active.map((a) => ({ id: a.id, title: a.title, step: a.step, rationale: a.rationale }))) });
+  if (run) { await run.check(); run.checkLive(); }
   const result = await client.responses.create({
     model: preferences.model || 'gpt-6-luna',
     instructions,
@@ -414,34 +430,34 @@ async function openAiRequest(caseRecord, preferences, requestData) {
     reasoning: { effort: preferences.effort || 'medium' },
     store: false,
     max_output_tokens: 5000
-  });
+  }, run ? { signal: run.controller.signal } : undefined);
   let output;
   try { output = JSON.parse(result.output_text || ''); }
   catch { throw new Error('AIから解析JSONを受け取れませんでした。前回の状況と方針はそのまま残しています。'); }
   output.provider = 'OpenAI / ' + (preferences.model || 'gpt-6-luna');
-  return { output, usage: result.usage || null };
+  return { output, usage: result.usage || null, sourceInputs: sourceInputsForRows(requestData.rows, 'openai') };
 }
 
-async function ollamaRequest(caseRecord, preferences, requestData) {
+async function ollamaRequest(caseRecord, preferences, requestData, run) {
   const endpoint = normalizeOllamaUrl(preferences.ollamaUrl);
   if (!preferences.ollamaModel || !preferences.ollamaModel.trim()) throw new Error('Ollamaモデル名を設定してください。');
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord) }];
-  let userText = '[シナリオ概要]\n' + (caseRecord.synopsis || '概要未入力');
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord, preferences.includeRoleProfile) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile) }];
+  let userText = synopsisText(caseRecord);
   const images = [];
   for (const { item, bytes, text } of requestData.rows) {
     userText += '\n\n' + renderEvidenceLabel(item) + '\n';
     if (item.kind === 'image') images.push(bytes.toString('base64'));
-    else if (item.kind === 'pdf' && !text.trim()) userText += '[このローカルモデル用にはPDF本文を抽出できませんでした。ページ画像も送っていません。]';
-    else userText += text || '[本文なし]';
+    userText += evidenceTextForInput(item, false);
   }
-  const active = (caseRecord.analysis && caseRecord.analysis.actions || []).filter((action) => action.status === 'active');
+  const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
   userText += '\n\n[現在有効な方針ID]\n' + JSON.stringify(active.map((a) => ({ id: a.id, title: a.title, step: a.step, rationale: a.rationale })));
   messages.push({ role: 'user', content: userText, images });
+  if (run) { await run.check(); run.checkLive(); }
   const response = await fetch(endpoint + '/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: preferences.ollamaModel.trim(), messages, stream: false, format: ANALYSIS_SCHEMA }),
-    signal: AbortSignal.timeout(180000)
+    signal: run ? AbortSignal.any([run.controller.signal, AbortSignal.timeout(180000)]) : AbortSignal.timeout(180000)
   });
   if (!response.ok) throw new Error('Ollama接続に失敗しました (' + response.status + '): ' + (await response.text()).slice(0, 300));
   const payload = await response.json();
@@ -449,22 +465,24 @@ async function ollamaRequest(caseRecord, preferences, requestData) {
   try { output = JSON.parse(payload.message && payload.message.content || ''); }
   catch { throw new Error('Ollamaから解析JSONを受け取れませんでした。前回の状況と方針はそのまま残しています。'); }
   output.provider = 'Ollama / ' + preferences.ollamaModel.trim() + (images.length ? '（画像を送信、モデルの対応可否は未確認）' : '');
-  return { output, usage: payload.prompt_eval_count != null ? { input_tokens: payload.prompt_eval_count, output_tokens: payload.eval_count || 0 } : null };
+  return { output, usage: payload.prompt_eval_count != null ? { input_tokens: payload.prompt_eval_count, output_tokens: payload.eval_count || 0 } : null,
+    sourceInputs: sourceInputsForRows(requestData.rows, 'ollama') };
 }
 
-async function codexRequest(caseRecord, preferences, requestData, signal) {
+async function codexRequest(caseRecord, preferences, requestData, signal, run) {
   return withCodexTurnLock('codex-analysis', async () => {
+    if (run) await run.check();
     if (!preferences.codexConsent) throw new CodexAppServerError('Codexへ資料を送る設定がオフです。設定画面で送信範囲を確認してください。', 'CONSENT_REQUIRED');
     if (signal && signal.aborted) throw new CodexAppServerError('Codex解析をキャンセルしました。', 'CANCELLED');
     const queuedCurrent = await readCase(caseRecord.id);
     if (queuedCurrent.revision !== caseRecord.revision) throw new CodexAppServerError('解析待ちの間にシナリオが更新されました。新しい状態から再解析してください。', 'STALE_INPUT');
-    const client = await getCodexClient(preferences.codexCliPath);
+    const client = await getCodexClient(preferences.codexCliPath, run);
     const auth = await readCodexAuth(client);
     if (!auth.authenticated) throw new CodexAppServerError(codexAuthMessage(auth), auth.reason || 'NOT_AUTHENTICATED');
     const models = await readCodexModels(client);
     const model = chooseCodexModel(models, preferences.codexModel);
     const effort = chooseCodexEffort(model, preferences.codexEffort);
-    const hasVisualEvidence = (caseRecord.evidence || []).some((item) => item.kind === 'image' || item.kind === 'pdf');
+    const hasVisualEvidence = requestData.rows.some(({ item }) => item.kind === 'image' || item.kind === 'pdf');
     if (hasVisualEvidence && !codexModelSupportsImages(model)) {
       throw new CodexAppServerError('選択中のCodexモデルは画像入力に対応していません。資料を省略せず、設定で画像対応モデルを選んでください。', 'IMAGE_MODEL_REQUIRED');
     }
@@ -472,9 +490,10 @@ async function codexRequest(caseRecord, preferences, requestData, signal) {
     try {
       prepared = await prepareCodexInput(caseRecord, requestData, {
         signal,
-        contextText: [roleText(caseRecord, preferences.includeRoleProfile), currentActionsText(caseRecord)].join('\n\n')
+        contextText: [roleText(caseRecord, preferences.includeRoleProfile), currentActionsText(caseRecord, preferences.includeRoleProfile), unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile)].join('\n\n')
       });
       const instructions = buildCodexDeveloperInstructions(SYSTEM_PROMPT);
+      if (run) { await run.check(); run.checkLive(); }
       const result = await client.runStructuredTurn({
         input: prepared.input,
         schema: ANALYSIS_SCHEMA,
@@ -486,58 +505,103 @@ async function codexRequest(caseRecord, preferences, requestData, signal) {
       });
       const output = parseStructuredResult(result.text);
       output.provider = 'Codex（ChatGPTの契約枠） / ' + model.displayName;
-      return { output, usage: null, model: model.id, pdfPages: prepared.pdfPages, imageBytes: prepared.imageBytes };
+      return { output, usage: null, model: model.id, pdfPages: prepared.pdfPages, imageBytes: prepared.imageBytes,
+        sourceInputs: sourceInputsForRows(requestData.rows, 'codex', prepared.pdfPageInputs) };
     } finally {
       await cleanupCodexInput(prepared);
     }
   });
 }
 
-async function analyzeCase(id, expectedRevision) {
-  const started = await readCase(id);
-  if (started.revision !== expectedRevision) return { status: 'stale', message: '新しい資料や変更があるため、古い解析結果を破棄しました。' };
-  const preferences = await readPreferences();
-  if (!['openai', 'ollama', 'codex'].includes(preferences.provider)) return { status: 'unconfigured', message: 'AI未接続です。資料と手動メモは保存されています。' };
-  if (preferences.provider === 'openai' && !(await hasStoredKey())) return { status: 'unconfigured', message: 'OpenAI APIキーが未設定です。' };
-  if (preferences.provider === 'openai' && !preferences.cloudConsent) return { status: 'unconfigured', message: 'クラウド送信の同意がありません。設定画面で送信範囲を確認してください。' };
-  if (preferences.provider === 'codex' && !preferences.codexConsent) return { status: 'unconfigured', message: 'Codexへ資料を送る同意がありません。設定画面で送信範囲を確認してください。' };
-  const codexKey = id + '::' + expectedRevision;
-  const codexController = preferences.provider === 'codex' ? new AbortController() : null;
-  if (codexController) {
-    const previous = activeCodexAnalyses.get(codexKey);
-    if (previous) previous.abort();
-    activeCodexAnalyses.set(codexKey, codexController);
+function analysisError(code) {
+  return Object.assign(new Error(code === 'CANCELLED' ? '解析を中止しました。資料と前回結果は保持しています。' : '保存済みの最新入力で更新します。'), { code });
+}
+
+// Checked again synchronously just before network dispatch and atomic rename.
+function assertRunLive(run) {
+  if (run.controller.signal.aborted) throw analysisError(run.controller.signal.reason?.code || 'CANCELLED');
+  if (run.settingsGeneration !== settingsGeneration || settingsSavePending) throw analysisError('STALE_SETTINGS');
+}
+
+async function assertAnalysisCurrent(run, started, preferences) {
+  assertRunLive(run);
+  const [latest, latestPreferences] = await Promise.all([readCase(run.id), readPreferences()]);
+  assertRunLive(run);
+  if (latest.revision !== started.revision) throw analysisError('STALE_INPUT');
+  if (analysisSettingsKey(latestPreferences, true) !== analysisSettingsKey(preferences, true)) throw analysisError('STALE_SETTINGS');
+}
+
+function analyzeCase(id, expectedRevision, options = {}) {
+  const existing = activeAnalyses.get(id);
+  if (existing) {
+    if (options.runId && existing.runId === options.runId && existing.expectedRevision === expectedRevision &&
+      existing.options.settingsVersion === options.settingsVersion && existing.options.automatic === options.automatic) return existing.promise;
+    // Share a barrier, not the previous run's result or cancel identity.
+    // No additional provider request is queued here.
+    return existing.promise.then(() => ({ status: 'busy' }));
   }
+  const run = { id, expectedRevision, runId: options.runId || randomUUID(), legacy: !options.runId,
+    controller: new AbortController(), settingsGeneration, provider: null, options };
+  activeAnalyses.set(id, run);
+  run.promise = Promise.resolve().then(() => performAnalysis(run)).finally(() => {
+    if (activeAnalyses.get(id) === run) activeAnalyses.delete(id);
+  });
+  return run.promise;
+}
+
+async function performAnalysis(run) {
+  const { id, expectedRevision } = run;
+  let preferences = {};
   let requestData = { rows: [], attachmentBytes: 0, textCharacters: 0 };
   try {
-    if (codexController && codexController.signal.aborted) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
-    requestData = await evidenceForRequest(started);
-    if (codexController && codexController.signal.aborted) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
+    assertRunLive(run);
+    if (run.options.settingsVersion !== undefined && run.options.settingsVersion !== settingsGeneration) throw analysisError('STALE_SETTINGS');
+    const started = await readCase(id);
+    if (started.revision !== expectedRevision) throw analysisError('STALE_INPUT');
+    preferences = await readPreferences();
+    run.provider = preferences.provider;
+    run.check = () => assertAnalysisCurrent(run, started, preferences);
+    run.checkLive = () => assertRunLive(run);
+    if (!['openai', 'ollama', 'codex'].includes(preferences.provider)) return { status: 'unconfigured', message: 'AI未接続です。資料は保存済みです。' };
+    if (preferences.provider === 'openai' && !(await hasStoredKey())) return { status: 'unconfigured', message: 'OpenAI APIキーが未設定です。' };
+    if (!canAnalyze(preferences)) return { status: 'unconfigured', message: 'AIへ資料を送る設定がオフです。資料は保存済みです。' };
+    if (run.options.automatic && !preferences.autoUpdate) return { status: 'cancelled', message: '自動更新は停止しました。資料は保存済みです。' };
+    requestData = await evidenceForRequest(started, preferences.includeRoleProfile, preferences.provider);
+    await run.check();
     const response = preferences.provider === 'openai'
-      ? await openAiRequest(started, preferences, requestData)
+      ? await openAiRequest(started, preferences, requestData, run)
       : preferences.provider === 'ollama'
-        ? await ollamaRequest(started, preferences, requestData)
-        : await codexRequest(started, preferences, requestData, codexController.signal);
-    return await withCaseLock(id, async () => {
+        ? await ollamaRequest(started, preferences, requestData, run)
+        : await codexRequest(started, preferences, requestData, run.controller.signal, run);
+    // Lock only the short commit, never AI waiting.
+    return await withSettingsLock('preferences', () => withCaseLock(id, async () => {
+      await run.check();
       const latest = await readCase(id);
-      if (latest.revision !== expectedRevision) return { status: 'stale', message: '解析中にシナリオが更新されたため、古い結果は保存しませんでした。' };
-      const output = response.output;
-      const updated = applyAnalysis(latest, output, expectedRevision);
+      assertRunLive(run);
+      if (latest.revision !== expectedRevision) throw analysisError('STALE_INPUT');
+      const sentItems = new Map(requestData.rows.map(({ item }) => [item.id, item]));
+      const inputRecord = { ...latest, evidence: latest.evidence.map((item) => sentItems.get(item.id) || item) };
+      const updated = applyAnalysis(inputRecord, response.output, expectedRevision, new Date().toISOString(), {
+        includeRoleProfile: preferences.includeRoleProfile === true,
+        evidenceIds: requestData.rows.map(({ item }) => item.id),
+        sourceInputs: response.sourceInputs
+      });
       updated.analysis.usage = response.usage;
-      updated.analysis.provider = output.provider;
-      await writeCase(updated);
-      return { status: 'ok', scenario: updated, usage: response.usage, attachmentBytes: requestData.attachmentBytes, textCharacters: requestData.textCharacters, pdfPages: response.pdfPages, imageBytes: response.imageBytes };
-    });
+      updated.analysis.provider = response.output.provider;
+      updated.analysis.settingsKey = analysisSettingsKey(preferences);
+      await writeCase(updated, run.checkLive);
+      return { status: 'ok', scenario: updated, usage: response.usage, attachmentBytes: requestData.attachmentBytes,
+        textCharacters: requestData.textCharacters, pdfPages: response.pdfPages, imageBytes: response.imageBytes };
+    }));
   } catch (error) {
-    if (codexController && (codexController.signal.aborted || error.code === 'CANCELLED')) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
-    if (error && error.code === 'STALE_INPUT') return { status: 'stale', message: error.message };
+    const code = run.controller.signal.aborted ? run.controller.signal.reason?.code || 'CANCELLED' : error?.code;
+    if (code === 'CANCELLED') return { status: 'cancelled', message: '解析を中止しました。資料と前回結果は保持しています。' };
+    if (code === 'STALE_INPUT' || code === 'STALE_SETTINGS') return { status: 'stale', message: '保存済みの最新入力で更新します。' };
     let secret;
     if (preferences.provider === 'openai' && safeStorage.isEncryptionAvailable()) {
       try { secret = safeStorage.decryptString(await fs.readFile(KEY_FILE)); } catch { secret = ''; }
     }
-    return { status: 'error', message: noSecrets(error && error.message, secret), attachmentBytes: requestData.attachmentBytes, textCharacters: requestData.textCharacters };
-  } finally {
-    if (codexController && activeCodexAnalyses.get(codexKey) === codexController) activeCodexAnalyses.delete(codexKey);
+    return { status: 'error', message: noSecrets(error?.message, secret), attachmentBytes: requestData.attachmentBytes, textCharacters: requestData.textCharacters };
   }
 }
 
@@ -567,8 +631,8 @@ function createWindow() {
 
 ipcMain.handle('app:get-info', async () => ({ version: app.getVersion(), platform: process.platform, dataFolder: APP_DIR }));
 ipcMain.handle('app:show-data-folder', async () => { await shell.openPath(APP_DIR); return true; });
-ipcMain.handle('settings:get', publicPreferences);
-ipcMain.handle('settings:save', async (_event, input) => {
+ipcMain.handle('settings:get', () => withSettingsLock('preferences', publicPreferences));
+ipcMain.handle('settings:save', async (_event, input) => withSettingsLock('preferences', async () => {
   input = input && typeof input === 'object' ? input : {};
   const safe = {
     provider: ['none', 'openai', 'ollama', 'codex'].includes(input.provider) ? input.provider : 'none',
@@ -587,16 +651,25 @@ ipcMain.handle('settings:save', async (_event, input) => {
   if (safe.model === 'gpt-6-astra' && safe.effort === 'none') throw new Error('GPT-6 Astraでは推論強度 none を選べません。');
   if (safe.provider === 'openai' && safe.autoUpdate && !safe.cloudConsent) throw new Error('自動更新を使うには資料送信範囲の確認が必要です。');
   if (safe.provider === 'codex' && safe.autoUpdate && !safe.codexConsent) throw new Error('Codexで自動更新を使うには資料送信範囲の確認が必要です。');
-  await fs.mkdir(APP_DIR, { recursive: true });
-  await fs.writeFile(PREFS_FILE, JSON.stringify(safe, null, 2), 'utf8');
-  const apiKey = String(input.apiKey || '').trim();
-  if (apiKey) {
-    if (!safeStorage.isEncryptionAvailable()) throw new Error('このWindows環境で暗号化ストレージを利用できません。APIキーを保存できません。');
-    await fs.writeFile(KEY_FILE, safeStorage.encryptString(apiKey));
-  }
-  if (input.removeKey) await fs.rm(KEY_FILE, { force: true });
-  return publicPreferences();
-});
+  settingsGeneration++;
+  settingsSavePending++;
+  for (const run of activeAnalyses.values()) run.controller.abort(analysisError('STALE_SETTINGS'));
+  try {
+    await fs.mkdir(APP_DIR, { recursive: true });
+    const apiKey = String(input.apiKey || '').trim();
+    if (apiKey) {
+      if (!safeStorage.isEncryptionAvailable()) throw new Error('このWindows環境で暗号化ストレージを利用できません。APIキーを保存できません。');
+      await fs.writeFile(KEY_FILE, safeStorage.encryptString(apiKey));
+    }
+    if (input.removeKey) await fs.rm(KEY_FILE, { force: true });
+    const temporary = PREFS_FILE + '.tmp-' + randomUUID();
+    try {
+      await fs.writeFile(temporary, JSON.stringify(safe, null, 2), 'utf8');
+      await fs.rename(temporary, PREFS_FILE);
+    } finally { await fs.rm(temporary, { force: true }); }
+    return await publicPreferences();
+  } finally { settingsSavePending--; }
+}));
 ipcMain.handle('settings:test-ai', async (_event, input) => {
   const saved = await readPreferences();
   const requestedProvider = input && ['none', 'openai', 'ollama', 'codex'].includes(input.provider) ? input.provider : saved.provider;
@@ -729,7 +802,9 @@ ipcMain.handle('scenario:create-demo', async () => {
   return record;
 });
 ipcMain.handle('scenario:save-profile', async (_event, payload) => mutateCase(payload.id, (current) => {
-  if (current.revision !== payload.expectedRevision) throw new Error('別の操作で更新されました。画面を読み直してください。');
+  const profile = { title: current.title, synopsis: current.synopsis, role: current.roleProfile?.role || '', goal: current.roleProfile?.goal || '', secret: current.roleProfile?.secret || '' };
+  const matchesProfile = payload.expectedProfile && Object.keys(profile).every((key) => profile[key] === payload.expectedProfile[key]);
+  if (current.revision !== payload.expectedRevision && !matchesProfile) throw new Error('シナリオ情報が別の操作で変更されました。入力中の内容は保持しています。');
   return { ...current, title: String(payload.title || '').trim() || '新しいシナリオ', synopsis: String(payload.synopsis || ''), roleProfile: { role: String(payload.role || ''), goal: String(payload.goal || ''), secret: String(payload.secret || '') }, revision: current.revision + 1, updatedAt: new Date().toISOString() };
 }));
 ipcMain.handle('scenario:delete', async (_event, id) => {
@@ -737,7 +812,9 @@ ipcMain.handle('scenario:delete', async (_event, id) => {
     const record = await readCase(id);
     const answer = await dialog.showMessageBox(mainWindow, { type: 'warning', title: 'シナリオと資料を削除', message: '「' + record.title + '」を削除しますか？', detail: 'このシナリオの状況・方針履歴・添付資料をこのアプリから削除します。先に残す場合はエクスポートしてください。', buttons: ['キャンセル', 'このシナリオを削除'], defaultId: 0, cancelId: 0, noLink: true });
     if (answer.response !== 1) return { deleted: false };
+    activeAnalyses.get(id)?.controller.abort(analysisError('CANCELLED'));
     await fs.rm(casePath(id), { recursive: true, force: false });
+    for (const [token, file] of stagedFiles) if (file.id === id) stagedFiles.delete(token);
     return { deleted: true };
   });
 });
@@ -750,55 +827,142 @@ ipcMain.handle('scenario:export', async (_event, id) => {
   await fs.cp(casePath(id), destination, { recursive: true, errorOnExist: true });
   return { exported: true, path: destination };
 });
-ipcMain.handle('scenario:add-text', async (_event, payload) => mutateCase(payload.id, async (current) => {
-  const text = String(payload.text ?? '');
-  if (!text) throw new Error('追加する内容を入力してください。');
-  const item = { id: randomUUID(), title: String(payload.title || 'メモ').trim().slice(0, 120) || 'メモ', kind: 'text', extractedText: text, extractionStatus: 'success', extractionMessage: '', byteSize: Buffer.byteLength(text, 'utf8'), visibility: ['shared', 'private', 'unknown'].includes(payload.visibility) ? payload.visibility : 'unknown', createdAt: new Date().toISOString() };
-  return { ...current, evidence: [...current.evidence, item], revision: current.revision + 1, updatedAt: new Date().toISOString() };
-}));
-ipcMain.handle('scenario:add-files', async (_event, id) => {
+async function chooseEvidenceFiles(id) {
+  await readCase(id);
   const selected = await dialog.showOpenDialog(mainWindow, { title: '資料を追加', properties: ['openFile', 'multiSelections'], filters: [{ name: '対応資料', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'webp', 'txt', 'md', 'markdown', 'csv', 'json'] }] });
   if (selected.canceled) return { canceled: true };
-  const beforeCount = (await readCase(id)).evidence.length;
-  const added = await mutateCase(id, async (current) => {
-    const additions = [];
-    for (const sourcePath of selected.filePaths) {
-      const type = detectFileType(sourcePath);
-      if (!type) continue;
+  await readCase(id);
+  const files = [];
+  for (const sourcePath of selected.filePaths) {
+    const token = randomUUID();
+    const type = detectFileType(sourcePath);
+    const candidate = { token, name: safeName(sourcePath), kind: type?.kind || 'text', byteSize: 0 };
+    try {
       const stat = await fs.stat(sourcePath);
-      if (stat.size > MAX_FILE_BYTES) throw new Error(safeName(sourcePath) + ' は20MBを超えています。ファイルを分けてください。');
-      const buffer = await fs.readFile(sourcePath);
-      let extracted = '';
-      let status = type.kind === 'pdf' ? 'error' : type.kind === 'text' ? 'success' : 'not_applicable';
-      let message = '';
-      if (type.kind === 'text') extracted = buffer.toString('utf8').replace(/^\uFEFF/, '');
-      if (type.kind === 'pdf') {
-        try {
-          const result = await extractPdfText(buffer);
-          extracted = result.text;
-          status = extracted.trim().length >= 10 ? 'success' : 'no_text';
-          message = status === 'no_text' ? '文字を抽出できませんでした。スキャンPDFの可能性があります。' : result.pages + 'ページから文字を抽出しました。';
-        } catch (error) {
-          status = 'error';
-          message = 'PDFの文字を抽出できませんでした。AI対応時もページ画像を送れる設定が必要です。';
-        }
-      }
-      additions.push(await storeEvidence(current, buffer, path.basename(sourcePath), type.kind, type.mimeType, extracted, status, message));
-    }
-    if (!additions.length) return current;
-    return { ...current, evidence: [...current.evidence, ...additions], revision: current.revision + 1, updatedAt: new Date().toISOString() };
-  });
-  return { canceled: false, scenario: added, addedCount: added.evidence.length - beforeCount };
-});
-ipcMain.handle('scenario:add-pasted-image', async (_event, payload) => mutateCase(payload.id, async (current) => {
-  const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(payload.dataUrl || ''));
+      candidate.byteSize = stat.size;
+      if (!type || !stat.isFile()) throw new Error('対応していない資料です。');
+      if (stat.size > MAX_FILE_BYTES) throw new Error('取り込み上限20MiBを超えています。');
+    } catch (error) { candidate.error = error.message; }
+    stagedFiles.set(token, { id, sourcePath, candidate });
+    files.push(candidate);
+  }
+  return { canceled: false, files };
+}
+
+function pastedImageBytes(dataUrl) {
+  const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ''));
   if (!match) throw new Error('貼り付け画像の形式を読み取れませんでした。PNG/JPEG/WebPを使ってください。');
+  if (match[2].length > Math.ceil(MAX_FILE_BYTES / 3) * 4) throw new Error('画像は20MiB以下にしてください。');
   const bytes = Buffer.from(match[2], 'base64');
-  if (!bytes.length || bytes.length > MAX_FILE_BYTES) throw new Error('画像は20MB以下にしてください。');
+  if (!bytes.length || bytes.length > MAX_FILE_BYTES) throw new Error('画像は20MiB以下にしてください。');
   const extension = match[1].split('/')[1].replace('jpeg', 'jpg');
-  const evidence = await storeEvidence(current, bytes, '貼り付け画像.' + extension, 'image', match[1], '', 'not_applicable', '画像データを保存しました。');
-  evidence.visibility = ['shared', 'private', 'unknown'].includes(payload.visibility) ? payload.visibility : 'unknown';
-  return { ...current, evidence: [...current.evidence, evidence], revision: current.revision + 1, updatedAt: new Date().toISOString() };
+  return { bytes, kind: 'image', mimeType: match[1], name: '貼り付け画像.' + extension };
+}
+
+async function addEvidence(payload) {
+  return withCaseLock(payload.id, async () => {
+    const current = await readCase(payload.id);
+    const tokens = payload.fileTokens || [];
+    const images = payload.images || [];
+    if (!Array.isArray(tokens) || !Array.isArray(images) || new Set(tokens).size !== tokens.length) throw new Error('追加候補を確認できません。');
+    const pending = [];
+    // Complete preflight before writing any originals; a failing candidate keeps the whole draft.
+    for (const token of tokens) {
+      const file = stagedFiles.get(token);
+      if (!file || file.id !== current.id) throw new Error('このシナリオの選択済みファイルを確認できません。選び直してください。');
+      const type = detectFileType(file.sourcePath);
+      const stat = await fs.stat(file.sourcePath);
+      if (!type || !stat.isFile()) throw new Error(file.candidate.name + ' は対応していない資料です。');
+      if (stat.size > MAX_FILE_BYTES) throw new Error(file.candidate.name + ' は取り込み上限20MiBを超えています。候補から外して再追加できます。');
+      const bytes = await fs.readFile(file.sourcePath);
+      if (bytes.length > MAX_FILE_BYTES) throw new Error(file.candidate.name + ' は20MiBを超えています。');
+      pending.push({ ...type, bytes, name: file.candidate.name });
+    }
+    for (const image of images) pending.push({ ...pastedImageBytes(image.dataUrl), title: image.title });
+    const text = String(payload.text ?? '');
+    if (!text.trim() && !pending.length) throw new Error('本文、ファイル、画像のいずれかを追加してください。');
+    const now = new Date().toISOString();
+    const visibility = ['shared', 'private', 'unknown'].includes(payload.visibility) ? payload.visibility : 'unknown';
+    const additions = [];
+    if (text.trim()) additions.push({ id: randomUUID(), title: inferEvidenceTitle(payload.title, text), kind: 'text', extractedText: text,
+      extractionStatus: 'success', extractionMessage: '', byteSize: Buffer.byteLength(text, 'utf8'), visibility, createdAt: now });
+    const writtenPaths = [];
+    try {
+      for (const input of pending) {
+        const pdf = input.kind === 'pdf' ? await extractPdfDocument(input.bytes) : {};
+        const body = input.kind === 'text' ? input.bytes.toString('utf8').replace(/^\uFEFF/, '') : pdf.extractedText || '';
+        const item = await storeEvidence(current, input.bytes, input.name, input.kind, input.mimeType, body,
+          pdf.extractionStatus || (input.kind === 'text' ? 'success' : 'not_applicable'), pdf.extractionMessage || '', pdf, writtenPaths);
+        item.title = inferEvidenceTitle(input.title, body, input.name);
+        item.visibility = visibility;
+        additions.push(item);
+      }
+      const next = { ...current, evidence: [...current.evidence, ...additions], revision: current.revision + 1, updatedAt: now };
+      await writeCase(next);
+      tokens.forEach((token) => stagedFiles.delete(token));
+      return next;
+    } catch (error) {
+      await Promise.all(writtenPaths.map((file) => fs.rm(file, { force: true })));
+      throw error;
+    }
+  });
+}
+
+ipcMain.handle('scenario:choose-files', async (_event, id) => chooseEvidenceFiles(id));
+ipcMain.handle('scenario:release-files', async (_event, payload) => {
+  for (const token of payload.tokens || []) if (stagedFiles.get(token)?.id === payload.id) stagedFiles.delete(token);
+});
+ipcMain.handle('scenario:add-evidence', async (_event, payload) => addEvidence(payload));
+ipcMain.handle('scenario:add-text', async (_event, payload) => addEvidence(payload));
+ipcMain.handle('scenario:add-pasted-image', async (_event, payload) => addEvidence({ ...payload, images: [{ dataUrl: payload.dataUrl }] }));
+ipcMain.handle('scenario:add-files', async (_event, id) => {
+  const selected = await chooseEvidenceFiles(id);
+  if (selected.canceled) return selected;
+  const scenario = await addEvidence({ id, fileTokens: selected.files.map((file) => file.token) });
+  return { canceled: false, scenario, addedCount: selected.files.length };
+});
+
+function preserveAnalysisSources(current) {
+  if (!current.analysis) return current;
+  const sources = current.analysis.sources || [];
+  const referencedIds = new Set([...(current.analysis.grounding?.evidenceIds || []),
+    ...(current.analysis.events || []).map((event) => event.sourceId),
+    ...['flow', 'facts', 'hypotheses', 'unknowns', 'actions'].flatMap((key) => (current.analysis[key] || []).flatMap((entry) => entry.evidenceIds || []))]);
+  const missing = (current.evidence || []).filter((item) => !sources.some((source) => source.id === item.id) &&
+    referencedIds.has(item.id));
+  const analysis = { ...current.analysis, sources: [...sources, ...missing.map((item) => ({ ...item }))] };
+  const attachSources = (action) => action.sourceSnapshots ? action : {
+    ...action, sourceSnapshots: analysis.sources.filter((source) => (action.evidenceIds || []).includes(source.id))
+  };
+  analysis.actions = (analysis.actions || []).map(attachSources);
+  const history = (current.analysisHistory || []).some((old) => old.revision === analysis.revision && old.updatedAt === analysis.updatedAt)
+    ? current.analysisHistory : [...(current.analysisHistory || []), analysis];
+  return { ...current, analysis, analysisHistory: history,
+    actionHistory: (current.actionHistory || []).map((action) => Number.isSafeInteger(action.grounding?.inputRevision) &&
+      JSON.stringify(action.grounding) === JSON.stringify(analysis.grounding) ? attachSources(action) : action) };
+}
+
+ipcMain.handle('scenario:edit-evidence', async (_event, payload) => mutateCase(payload.id, (current) => {
+  const saved = current.evidence.find((item) => item.id === payload.evidenceId);
+  if (!saved) throw new Error('資料が見つかりません。');
+  if (payload.expectedUpdatedAt !== (saved.updatedAt || saved.createdAt)) throw new Error('この資料は別の操作で変更されています。編集内容は下書きに残っています。');
+  if (typeof payload.text !== 'string' || typeof payload.title !== 'string') throw new Error('見出しと本文を確認できません。');
+  const before = preserveAnalysisSources(current);
+  const now = new Date().toISOString();
+  return { ...before, evidence: before.evidence.map((item) => item.id !== saved.id ? item : {
+    ...item, originalTitle: item.originalTitle ?? item.title, title: inferEvidenceTitle(payload.title, payload.text, item.originalName),
+    editedText: payload.text, updatedAt: now
+  }), revision: current.revision + 1, updatedAt: now };
+}));
+ipcMain.handle('scenario:set-evidence-enabled', async (_event, payload) => mutateCase(payload.id, (current) => {
+  if (typeof payload.enabled !== 'boolean') throw new Error('解析対象の状態を確認できません。');
+  const saved = current.evidence.find((item) => item.id === payload.evidenceId);
+  if (!saved) throw new Error('資料が見つかりません。');
+  if ((saved.analysisEnabled !== false) === payload.enabled) return current;
+  const before = preserveAnalysisSources(current);
+  const now = new Date().toISOString();
+  return { ...before, evidence: before.evidence.map((item) => item.id !== saved.id ? item : { ...item, analysisEnabled: payload.enabled }),
+    revision: current.revision + 1, updatedAt: now };
 }));
 ipcMain.handle('scenario:set-visibility', async (_event, payload) => mutateCase(payload.id, (current) => {
   if (!['shared', 'private', 'unknown'].includes(payload.visibility)) throw new Error('公開範囲を選んでください。');
@@ -818,23 +982,59 @@ ipcMain.handle('scenario:preview-image', async (_event, payload) => {
   const bytes = await fs.readFile(attachmentPath(record.id, item.attachmentPath));
   return 'data:' + item.mimeType + ';base64,' + bytes.toString('base64');
 });
-ipcMain.handle('scenario:complete-action', async (_event, payload) => mutateCase(payload.id, (current) => {
-  const actions = current.analysis && current.analysis.actions || [];
-  const selected = actions.find((action) => action.id === payload.actionId && action.status === 'active');
-  if (!selected) throw new Error('有効な方針を選んでください。');
-  const now = new Date().toISOString();
-  return { ...current, revision: current.revision + 1, updatedAt: now, analysis: { ...current.analysis, actions: actions.filter((action) => action.id !== payload.actionId) }, actionHistory: [...(current.actionHistory || []), { ...selected, status: 'completed', retiredAt: now, retirementReason: '対応済み', replacedByActionId: null }] };
-}));
-ipcMain.handle('scenario:discard-action', async (_event, payload) => mutateCase(payload.id, (current) => discardAction(current, payload.actionId, payload.reason)));
+ipcMain.handle('scenario:read-source', async (_event, payload) => {
+  const record = await readCase(payload.id);
+  const history = record.analysisHistory || [];
+  if (payload.analysisIndex !== undefined && !(Number.isInteger(payload.analysisIndex) && payload.analysisIndex >= 0 && payload.analysisIndex < history.length)) {
+    throw new Error('保存された解析を確認できません。');
+  }
+  const analysis = payload.analysisIndex === undefined ? record.analysis : history[payload.analysisIndex];
+  const fallbackSources = payload.analysisIndex === undefined ? history.slice().reverse().flatMap((entry) => entry.sources || []) : [];
+  const action = payload.actionId ? [...(record.analysis?.actions || []), ...(record.actionHistory || [])].find((entry) => entry.id === payload.actionId) : null;
+  if (payload.actionId && !action) throw new Error('出典を開く行動が見つかりません。');
+  const snapshot = payload.current === true ? null : action?.sourceSnapshots?.find((entry) => entry.id === payload.evidenceId) ||
+    (action ? (Number.isSafeInteger(action.grounding?.inputRevision) ? [record.analysis, ...history].find((entry) => entry?.inputRevision === action.grounding.inputRevision)?.sources?.find((entry) => entry.id === payload.evidenceId) : undefined) :
+      analysis?.sources?.find((entry) => entry.id === payload.evidenceId) || fallbackSources.find((entry) => entry.id === payload.evidenceId));
+  const item = snapshot || (record.evidence || []).find((entry) => entry.id !== SYNOPSIS_SOURCE_ID && entry.id !== ROLE_PROFILE_SOURCE_ID && entry.id === payload.evidenceId);
+  if (!item) throw new Error('資料が見つかりません。');
+  const snapshotUnavailable = !snapshot && payload.current !== true && Boolean(action || analysis || payload.analysisIndex !== undefined);
+  const base = { title: snapshotUnavailable ? item.originalTitle || item.title : item.title, kind: item.kind, text: item.extractedText || '',
+    editedText: snapshotUnavailable ? undefined : item.editedText, snapshot: Boolean(snapshot), snapshotUnavailable,
+    dataUrl: '', pageNumber: null, pageCount: null, pdfPages: [], extractionMessage: item.extractionMessage || '' };
+  if (item.kind === 'text') return base;
+  let bytes;
+  try {
+    if (!item.attachmentPath) throw new Error('Missing attachment');
+    bytes = await fs.readFile(attachmentPath(record.id, item.attachmentPath));
+    if (!bytes.length) throw new Error('Empty attachment');
+  } catch { return { ...base, error: '原本を読み取れません。保存済みの本文は下に表示します。' }; }
+  if (item.kind === 'image') return { ...base, dataUrl: 'data:' + item.mimeType + ';base64,' + bytes.toString('base64') };
+  const metadata = hasPdfMetadata(item) ? item : await extractPdfDocument(bytes);
+  const number = payload.page === undefined || payload.page === '' ? 1 : parsePdfPage(payload.page);
+  const result = { ...base, pageNumber: number, pageCount: metadata.pdfPageCount, pdfPages: metadata.pdfPages,
+    text: metadata.pdfPages.find((page) => page.pageNumber === number)?.text ?? (metadata.pdfPageCount === null ? base.text : ''), extractionMessage: metadata.extractionMessage };
+  if (!number) return { ...result, error: 'PDFのページ番号が不正です。' };
+  try {
+    const rendered = await renderPdfPage(bytes, number);
+    return { ...result, pageNumber: rendered.pageNumber, pageCount: rendered.pageCount, dataUrl: rendered.dataUrl,
+      text: metadata.pdfPages.find((page) => page.pageNumber === number)?.text || '' };
+  } catch (error) {
+    const message = /このアプリ|指定したPDFページ|ページ番号/.test(error.message) ? error.message : 'PDFページの原本を表示できませんでした。';
+    return { ...result, error: message };
+  }
+});
+ipcMain.handle('scenario:complete-action', async (_event, payload) => mutateCase(payload.id, async (current) =>
+  completeAction(current, payload.actionId, new Date().toISOString(), await readPreferences())));
+ipcMain.handle('scenario:discard-action', async (_event, payload) => mutateCase(payload.id, async (current) =>
+  discardAction(current, payload.actionId, payload.reason, new Date().toISOString(), await readPreferences())));
+ipcMain.handle('scenario:action-notes', async (_event, payload) => mutateCase(payload.id, async (current) =>
+  updateActionNotes(current, payload.actionId, { reason: payload.reason, resultNote: payload.resultNote }, new Date().toISOString(), await readPreferences())));
 ipcMain.handle('scenario:restore-action', async (_event, payload) => mutateCase(payload.id, (current) => restoreAction(current, payload.actionId)));
-ipcMain.handle('scenario:analyze', async (_event, payload) => analyzeCase(payload.id, payload.expectedRevision));
+ipcMain.handle('scenario:analyze', async (_event, payload) => analyzeCase(payload.id, payload.expectedRevision, payload));
 ipcMain.handle('scenario:cancel-analysis', async (_event, payload) => {
-  const id = String(payload && payload.id || '');
-  const revision = Number(payload && payload.expectedRevision);
-  if (!id || !Number.isSafeInteger(revision)) return { canceled: false };
-  const controller = activeCodexAnalyses.get(id + '::' + revision);
-  if (!controller) return { canceled: false };
-  controller.abort();
+  const run = activeAnalyses.get(String(payload?.id || ''));
+  if (!run || (payload.runId ? run.runId !== payload.runId : !run.legacy || run.expectedRevision !== Number(payload.expectedRevision))) return { canceled: false };
+  run.controller.abort(analysisError('CANCELLED'));
   return { canceled: true };
 });
 
@@ -845,10 +1045,10 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', (event) => {
+  for (const run of activeAnalyses.values()) run.controller.abort(analysisError('CANCELLED'));
   if (closingCodexForQuit || !codexClient) return;
   event.preventDefault();
   closingCodexForQuit = true;
-  for (const controller of activeCodexAnalyses.values()) controller.abort();
   Promise.resolve(stopCodexClient()).finally(() => app.quit());
 });
 
