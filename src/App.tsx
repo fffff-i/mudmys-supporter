@@ -1,5 +1,6 @@
 import { FormEvent, ClipboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createSelectionGuard } from '../shared/selectionGuard.mjs';
+import { createScenarioDrafts, type ProfileDraft, type TextDraft } from '../shared/scenarioDrafts.mjs';
 import type { Action, AppSettings, CodexConnectionStatus, Evidence, Scenario, Visibility } from './types';
 
 type Page = 'overview' | 'evidence' | 'plans' | 'history' | 'settings';
@@ -42,6 +43,7 @@ function sourceName(scenario: Scenario, id: string) {
 
 function App() {
   const selectionGuard = useRef(createSelectionGuard());
+  const scenarioDrafts = useRef(createScenarioDrafts());
   const displayedScenario = useRef<Scenario | null>(null);
   const deletedScenarioIds = useRef(new Set<string>());
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
@@ -60,10 +62,9 @@ function App() {
   const [preview, setPreview] = useState('');
   const [discardId, setDiscardId] = useState('');
   const [discardReason, setDiscardReason] = useState('');
-  const [textTitle, setTextTitle] = useState('');
-  const [textDraft, setTextDraft] = useState('');
-  const [textVisibility, setTextVisibility] = useState<Visibility>('unknown');
-  const [profileDraft, setProfileDraft] = useState({ title: '', synopsis: '', role: '', goal: '', secret: '' });
+  const [, setDraftVersion] = useState(0);
+  const draft = scenario && !deletedScenarioIds.current.has(scenario.id) ? scenarioDrafts.current.read(scenario) : null;
+  const refreshDrafts = () => setDraftVersion((current) => current + 1);
   const activeAnalysisRef = useRef<{ id: string; expectedRevision: number; codex: boolean } | null>(null);
 
   const activeActions = scenario?.analysis?.actions.filter((action) => action.status === 'active') || [];
@@ -81,7 +82,7 @@ function App() {
   }, [settings.provider, settings.codexConsent]);
 
   const applyScenario = (next: Scenario, token: ReturnType<ReturnType<typeof createSelectionGuard>['capture']>) => {
-    if (!selectionGuard.current.canApply(token, next, displayedScenario.current)) return false;
+    if (deletedScenarioIds.current.has(next.id) || !selectionGuard.current.canApply(token, next, displayedScenario.current)) return false;
     displayedScenario.current = next;
     setScenario(next);
     return true;
@@ -115,17 +116,6 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!scenario) return;
-    setProfileDraft({
-      title: scenario.title,
-      synopsis: scenario.synopsis,
-      role: scenario.roleProfile?.role || '',
-      goal: scenario.roleProfile?.goal || '',
-      secret: scenario.roleProfile?.secret || ''
-    });
-  }, [scenario?.id]);
-
-  useEffect(() => {
     if (!selectedEvidence) { setPreview(''); return; }
     setPreview('');
   }, [selectedEvidence, scenario?.id]);
@@ -144,6 +134,35 @@ function App() {
     setError('');
     setNotice(message);
     if (runAutomatic && settings.autoUpdate && aiConnected) await runAnalysis(next, true, token);
+  };
+
+  const updateDraftScenario = async (saved: Scenario, message: string, token: ReturnType<ReturnType<typeof createSelectionGuard>['capture']>) => {
+    if (deletedScenarioIds.current.has(saved.id)) return;
+    if (selectionGuard.current.isCurrent(token)) {
+      await updateScenario(saved, message, true, token);
+      return;
+    }
+    mergeScenario(saved);
+    const currentToken = selectionGuard.current.capture();
+    if (currentToken.id !== saved.id) return;
+    // Returning during a save starts a new selection. Read its current record
+    // rather than applying the response belonging to the earlier selection.
+    try {
+      const loaded = await window.makua.getScenario(saved.id);
+      await updateScenario(loaded, message, true, currentToken);
+    } catch (reason) { reportError(reason, currentToken); }
+  };
+
+  const editTextDraft = (patch: Partial<TextDraft>) => {
+    if (!scenario || selectionGuard.current.capture().id !== scenario.id) return;
+    scenarioDrafts.current.editText(scenario, patch);
+    refreshDrafts();
+  };
+
+  const editProfileDraft = (profile: ProfileDraft) => {
+    if (!scenario || selectionGuard.current.capture().id !== scenario.id) return;
+    scenarioDrafts.current.editProfile(scenario, profile);
+    refreshDrafts();
   };
 
   const runAnalysis = async (target = scenario, automatic = false, token = selectionGuard.current.capture()) => {
@@ -195,14 +214,20 @@ function App() {
     }
     setBusy(false);
     setAutoBusy(false);
+    const cached = scenarios.find((item) => item.id === id);
+    if (cached) applyScenario(cached, token);
+    else { displayedScenario.current = null; setScenario(null); }
+    setPage('overview');
+    setSelectedEvidence('');
+    setDiscardId('');
+    setDiscardReason('');
+    setNotice('');
+    setError('');
     try {
       const loaded = await window.makua.getScenario(id);
       if (!selectionGuard.current.isCurrent(token)) return;
+      mergeScenario(loaded);
       applyScenario(loaded, token);
-      setPage('overview');
-      setSelectedEvidence('');
-      setNotice('');
-      setError('');
     } catch (reason) { reportError(reason, token); }
   };
 
@@ -249,27 +274,40 @@ function App() {
 
   const saveProfile = async (event: FormEvent) => {
     event.preventDefault();
-    if (!scenario) return;
+    if (!scenario || selectionGuard.current.capture().id !== scenario.id) return;
     const token = selectionGuard.current.capture();
+    const request = scenarioDrafts.current.beginProfileSave(scenario);
+    if (!request) return;
+    refreshDrafts();
     try {
-      const saved = await window.makua.saveProfile({ id: scenario.id, expectedRevision: scenario.revision, ...profileDraft });
-      await updateScenario(saved, 'シナリオ情報を保存しました。', true, token);
+      const saved = await window.makua.saveProfile({ id: request.id, expectedRevision: scenario.revision, ...request.value });
+      scenarioDrafts.current.finishProfileSave(request, saved);
+      refreshDrafts();
+      await updateDraftScenario(saved, 'シナリオ情報を保存しました。', token);
     } catch (reason) {
+      scenarioDrafts.current.finishProfileSave(request, null);
+      refreshDrafts();
       reportError(reason, token);
     }
   };
 
   const addText = async (event: FormEvent) => {
     event.preventDefault();
-    if (!scenario || !textDraft.trim()) return;
+    if (!scenario || selectionGuard.current.capture().id !== scenario.id) return;
     const token = selectionGuard.current.capture();
+    const request = scenarioDrafts.current.beginTextSave(scenario);
+    if (!request) return;
+    refreshDrafts();
     try {
-      const saved = await window.makua.addText({ id: scenario.id, title: textTitle, text: textDraft, visibility: textVisibility });
-      if (!selectionGuard.current.isCurrent(token)) { mergeScenario(saved); return; }
-      setTextDraft('');
-      setTextTitle('');
-      await updateScenario(saved, '資料を原文のまま保存しました。', true, token);
-    } catch (reason) { reportError(reason, token); }
+      const saved = await window.makua.addText({ id: request.id, ...request.value });
+      scenarioDrafts.current.finishTextSave(request, saved);
+      refreshDrafts();
+      await updateDraftScenario(saved, '資料を原文のまま保存しました。', token);
+    } catch (reason) {
+      scenarioDrafts.current.finishTextSave(request, null);
+      refreshDrafts();
+      reportError(reason, token);
+    }
   };
 
   const addFiles = async () => {
@@ -352,6 +390,7 @@ function App() {
       const answer = await window.makua.deleteScenario(targetId);
       if (!answer.deleted) return;
       deletedScenarioIds.current.add(targetId);
+      scenarioDrafts.current.delete(targetId);
       const remaining = (await window.makua.listScenarios());
       setScenarios((current) => remaining.map((fresh) => {
         const existing = current.find((item) => item.id === fresh.id);
@@ -444,7 +483,7 @@ function App() {
           {(notice || error) && <div className={'toast ' + (error ? 'toast-error' : '')}><span>{error ? '!' : '✓'}</span><div>{error || notice}</div><button onClick={() => { setNotice(''); setError(''); }} aria-label="閉じる">×</button></div>}
           {!scenario && page !== 'settings' && <EmptyState onNew={() => setCreateOpen(true)} onDemo={createDemo} />}
           {scenario && page === 'overview' && <Overview scenario={scenario} settings={settings} busy={busy || autoBusy} activeActions={activeActions} onEdit={() => setPage('evidence')} onPlans={() => setPage('plans')} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={(action) => { setDiscardId(action.id); setDiscardReason(''); setPage('plans'); }} />}
-          {scenario && page === 'evidence' && <EvidencePage scenario={scenario} title={textTitle} setTitle={setTextTitle} draft={textDraft} setDraft={setTextDraft} visibility={textVisibility} setVisibility={setTextVisibility} onAddText={addText} onAddFiles={addFiles} onVisibility={setEvidenceVisibility} selected={selectedEvidence} onSelect={setSelectedEvidence} preview={preview} onPreview={previewImage} onProfileSave={saveProfile} profile={profileDraft} setProfile={setProfileDraft} totalChars={totalTextChars} totalBytes={totalAttachmentBytes} settings={settings} />}
+          {scenario && draft && page === 'evidence' && <EvidencePage scenario={scenario} title={draft.text.title} setTitle={(title) => editTextDraft({ title })} draft={draft.text.text} setDraft={(text) => editTextDraft({ text })} visibility={draft.text.visibility} setVisibility={(visibility) => editTextDraft({ visibility })} textSaving={draft.textSaving} profileSaving={draft.profileSaving} onAddText={addText} onAddFiles={addFiles} onVisibility={setEvidenceVisibility} selected={selectedEvidence} onSelect={setSelectedEvidence} preview={preview} onPreview={previewImage} onProfileSave={saveProfile} profile={draft.profile} setProfile={editProfileDraft} totalChars={totalTextChars} totalBytes={totalAttachmentBytes} settings={settings} />}
           {scenario && page === 'plans' && <PlansPage scenario={scenario} actions={activeActions} settings={settings} busy={busy || autoBusy} onAnalyze={() => runAnalysis()} onEvidence={goToEvidence} onComplete={completeAction} onDiscardStart={(action) => { setDiscardId(action.id); setDiscardReason(''); }} discardId={discardId} discardReason={discardReason} setDiscardReason={setDiscardReason} onDiscard={discardAction} onDiscardCancel={() => { setDiscardId(''); setDiscardReason(''); }} />}
           {scenario && page === 'history' && <HistoryPage scenario={scenario} history={historyActions} onRestore={restoreAction} onEvidence={goToEvidence} />}
           {page === 'settings' && <div className="settings-scroll" role="region" aria-label="接続と保存の設定" tabIndex={0}><SettingsPage settings={settings} onSettings={setSettings} onSaved={setSettings} onCodexStatus={receiveCodexStatus} codexStatus={codexStatus} onDataFolder={() => window.makua.showDataFolder()} onError={reportError} onDelete={deleteScenario} scenario={scenario} /></div>}
@@ -553,8 +592,9 @@ function ScenarioSetupForm({ scenario, onSave }: { scenario: Scenario; onSave: (
   return <div className="setup-reminder"><div className="setup-reminder-icon">✎</div><div><strong>シナリオ概要とあなたの目的を記録できます</strong><p>HOに書かれた役・目的は解析で読み取ります。別欄への補足は任意です。原資料は「資料を追加」へ保存します。</p></div></div>;
 }
 
-function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, setVisibility, onAddText, onAddFiles, onVisibility, selected, onSelect, preview, onPreview, onProfileSave, profile, setProfile, totalChars, totalBytes, settings }: {
+function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, setVisibility, textSaving, profileSaving, onAddText, onAddFiles, onVisibility, selected, onSelect, preview, onPreview, onProfileSave, profile, setProfile, totalChars, totalBytes, settings }: {
   scenario: Scenario; title: string; setTitle: (value: string) => void; draft: string; setDraft: (value: string) => void; visibility: Visibility; setVisibility: (value: Visibility) => void;
+  textSaving: boolean; profileSaving: boolean;
   onAddText: (event: FormEvent) => void; onAddFiles: () => void; onVisibility: (item: Evidence, value: Visibility) => void; selected: string; onSelect: (id: string) => void;
   preview: string; onPreview: (item: Evidence) => void; onProfileSave: (event: FormEvent) => void; profile: { title: string; synopsis: string; role: string; goal: string; secret: string };
   setProfile: (value: { title: string; synopsis: string; role: string; goal: string; secret: string }) => void; totalChars: number; totalBytes: number; settings: AppSettings;
@@ -568,7 +608,7 @@ function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, 
           <label className="field-label">見出し <span>任意</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例：食堂で聞いたこと"/></label>
           <label className="field-label">本文 <span>原文のまま保存</span><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="会話、配布情報、気づいたことを貼り付けます。時刻や言い回しはそのまま残ります。" rows={8}/></label>
           <VisibilitySelect value={visibility} onChange={setVisibility}/>
-          <button className="button button-ink full-button" type="submit" disabled={!draft.trim()}>メモを資料に追加 <span>→</span></button>
+          <button className="button button-ink full-button" type="submit" disabled={textSaving || !draft.trim()}>メモを資料に追加 <span>→</span></button>
         </form>
         <div className="panel import-panel">
           <div className="panel-top"><div><span className="panel-kicker">FILES & SCREENSHOTS</span><h2>PDF・画像を追加</h2></div><span className="step-pill">02</span></div>
@@ -587,7 +627,7 @@ function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, 
             <label className="field-label">達成したい目的<textarea rows={2} value={profile.goal} onChange={(event) => setProfile({ ...profile, goal: event.target.value })} placeholder="例：疑いを避ける／大切な人物を守る／交渉を成立させる"/></label>
             <label className="field-label">自分だけの秘密<textarea rows={2} value={profile.secret} onChange={(event) => setProfile({ ...profile, secret: event.target.value })} placeholder="必要なとき、分析に含めるかは設定から選べます。"/></label>
           </details>
-          <button className="button button-green full-button" type="submit">シナリオ情報を保存</button>
+          <button className="button button-green full-button" type="submit" disabled={profileSaving}>シナリオ情報を保存</button>
         </form>
       </div>
       <div className="evidence-list-column">
