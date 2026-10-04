@@ -1,6 +1,6 @@
 {
   "name": "makua-mystery-notebook",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "シナリオ資料を根拠に状況と次の確認行動を整理するデスクトップノート",
   "main": "electron/main.cjs",
@@ -33,7 +33,7 @@
     "appId": "jp.makua.mysterynotebook",
     "productName": "幕間ノート",
     "directories": {
-      "output": "release-v0.2.1"
+      "output": "release-v0.3.0"
     },
     "files": [
       "dist/**",

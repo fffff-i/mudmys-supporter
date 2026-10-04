@@ -36,7 +36,7 @@ PDF原本表示と出典を画面から検証するには、ビルド後に `nod
 
 行動の1クリック保存、任意メモ、保存中のシナリオ切替と追加入力は、ビルド後に `node scripts/verifyActionHistory.cjs` でヘッドレス検証できます。架空データと固有のブラウザープロファイルだけを使い、結果はこのコピーの `.local/action-history-ui/results.json` に保存します。
 
-Windows向けportable版を生成するには `npm run package:portable` を実行します。生成物は `release-v0.2.1/` に出力されます。このフォルダーは公開リポジトリには含めません。
+Windows向けportable版を生成するには `npm run package:portable` を実行します。生成物は `release-v0.3.0/` に出力されます。このフォルダーは公開リポジトリには含めません。
 
 ## AI接続
 
