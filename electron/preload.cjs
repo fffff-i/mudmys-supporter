@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('makua', {
   addPastedImage: (value) => ipcRenderer.invoke('scenario:add-pasted-image', value),
   setVisibility: (value) => ipcRenderer.invoke('scenario:set-visibility', value),
   previewImage: (value) => ipcRenderer.invoke('scenario:preview-image', value),
+  readSource: (value) => ipcRenderer.invoke('scenario:read-source', value),
   completeAction: (value) => ipcRenderer.invoke('scenario:complete-action', value),
   discardAction: (value) => ipcRenderer.invoke('scenario:discard-action', value),
   restoreAction: (value) => ipcRenderer.invoke('scenario:restore-action', value),

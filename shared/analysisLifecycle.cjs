@@ -1,6 +1,7 @@
 const { randomUUID } = require('node:crypto');
 const { getAnalysisSources, getFixedAnalysisSources } = require('./analysisSources.cjs');
 const { INPUT_PROVENANCE_VERSION, getAnalysisContext } = require('./analysisScope.cjs');
+const { verifyEventQuote } = require('./pdfSources.cjs');
 
 function normalize(text) {
   return String(text || '').normalize('NFKC').toLowerCase().replace(/[\s、。！？!?・.,:：;；「」『』()（）]/g, '');
@@ -76,15 +77,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
   const events = (output.events || []).map((event) => {
     const source = evidenceById.get(event.sourceId);
     assert(source, 'イベントに存在しない資料IDが含まれました。');
-    let quoteOrigin = source.kind === 'image' ? '画像からの読取（原文一致は未検証）' : 'PDF画像からの読取（原文一致は未検証）';
-    if ((source.kind === 'text' || source.kind === 'pdf') && source.extractedText && source.extractionStatus !== 'no_text') {
-      const normalizeSpaces = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-      const quote = normalizeSpaces(event.quote);
-      const original = normalizeSpaces(source.extractedText);
-      assert(quote && original.includes(quote), '資料の原文に一致しないイベント引用があったため、前回結果を保持しました。');
-      quoteOrigin = 'テキスト抽出と原文一致';
-    }
-    return { ...event, quoteOrigin };
+    return verifyEventQuote(event, source, options.sourceInputs?.[source.id]);
   });
 
   const retiredActions = Array.isArray(output.retirements) ? output.retirements : [];

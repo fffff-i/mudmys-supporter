@@ -1,9 +1,11 @@
 import { FormEvent, ClipboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createSelectionGuard } from '../shared/selectionGuard.mjs';
 import { createScenarioDrafts, type ProfileDraft, type TextDraft } from '../shared/scenarioDrafts.mjs';
-import type { Action, AppSettings, CodexConnectionStatus, Evidence, Scenario, Visibility } from './types';
+import { createSourceReader, type SourceViewState } from '../shared/sourceReader.mjs';
+import type { Action, AppSettings, CodexConnectionStatus, EventRecord, Evidence, Scenario, Visibility } from './types';
 
 type Page = 'overview' | 'evidence' | 'plans' | 'history' | 'settings';
+type OpenSource = (id: string, page?: string, verification?: string) => void;
 const PAGES: { id: Page; label: string; mark: string }[] = [
   { id: 'overview', label: '現在地', mark: '○' },
   { id: 'evidence', label: '資料を追加', mark: '＋' },
@@ -65,6 +67,8 @@ function App() {
   const [newTitle, setNewTitle] = useState('');
   const [selectedEvidence, setSelectedEvidence] = useState('');
   const [preview, setPreview] = useState('');
+  const [sourceView, setSourceView] = useState<SourceViewState | null>(null);
+  const sourceReader = useRef(createSourceReader((request) => window.makua.readSource(request), setSourceView));
   const [discardId, setDiscardId] = useState('');
   const [discardReason, setDiscardReason] = useState('');
   const [, setDraftVersion] = useState(0);
@@ -88,6 +92,7 @@ function App() {
 
   const applyScenario = (next: Scenario, token: ReturnType<ReturnType<typeof createSelectionGuard>['capture']>) => {
     if (deletedScenarioIds.current.has(next.id) || !selectionGuard.current.canApply(token, next, displayedScenario.current)) return false;
+    if (displayedScenario.current?.id !== next.id) sourceReader.current.close();
     displayedScenario.current = next;
     setScenario(next);
     return true;
@@ -124,6 +129,15 @@ function App() {
     if (!selectedEvidence) { setPreview(''); return; }
     setPreview('');
   }, [selectedEvidence, scenario?.id]);
+
+  useEffect(() => {
+    if (!sourceView) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') sourceReader.current.close(); };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [Boolean(sourceView)]);
+
+  useEffect(() => () => sourceReader.current.close(), []);
 
   const reportError = (reason: unknown, token?: ReturnType<ReturnType<typeof createSelectionGuard>['capture']>) => {
     if (token && !selectionGuard.current.isCurrent(token)) return;
@@ -212,6 +226,7 @@ function App() {
   };
 
   const openScenario = async (id: string) => {
+    sourceReader.current.close();
     const token = selectionGuard.current.select(id);
     const activeRun = activeAnalysisRef.current;
     if (activeRun?.codex && activeRun.id !== id) {
@@ -437,10 +452,9 @@ function App() {
     } catch (reason) { reportError(reason, token); }
   };
 
-  const goToEvidence = (id: string) => {
-    setSelectedEvidence(id);
-    setPage('evidence');
-    window.setTimeout(() => document.getElementById('evidence-' + id)?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100);
+  const goToEvidence: OpenSource = (id, sourcePage, verification) => {
+    if (!scenario) return;
+    void sourceReader.current.open({ id: scenario.id, evidenceId: id, page: sourcePage }, verification);
   };
 
   if (loading) return <div className="loading-screen"><div className="brand-stamp">幕</div><p>資料の棚を開いています…</p></div>;
@@ -488,15 +502,42 @@ function App() {
           {(notice || error) && <div className={'toast ' + (error ? 'toast-error' : '')}><span>{error ? '!' : '✓'}</span><div>{error || notice}</div><button onClick={() => { setNotice(''); setError(''); }} aria-label="閉じる">×</button></div>}
           {!scenario && page !== 'settings' && <EmptyState onNew={() => setCreateOpen(true)} onDemo={createDemo} />}
           {scenario && page === 'overview' && <Overview scenario={scenario} settings={settings} busy={busy || autoBusy} activeActions={activeActions} onEdit={() => setPage('evidence')} onPlans={() => setPage('plans')} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={(action) => { setDiscardId(action.id); setDiscardReason(''); setPage('plans'); }} />}
-          {scenario && draft && page === 'evidence' && <EvidencePage scenario={scenario} title={draft.text.title} setTitle={(title) => editTextDraft({ title })} draft={draft.text.text} setDraft={(text) => editTextDraft({ text })} visibility={draft.text.visibility} setVisibility={(visibility) => editTextDraft({ visibility })} textSaving={draft.textSaving} profileSaving={draft.profileSaving} onAddText={addText} onAddFiles={addFiles} onVisibility={setEvidenceVisibility} selected={selectedEvidence} onSelect={setSelectedEvidence} preview={preview} onPreview={previewImage} onProfileSave={saveProfile} profile={draft.profile} setProfile={editProfileDraft} totalChars={totalTextChars} totalBytes={totalAttachmentBytes} settings={settings} />}
+          {scenario && draft && page === 'evidence' && <EvidencePage scenario={scenario} title={draft.text.title} setTitle={(title) => editTextDraft({ title })} draft={draft.text.text} setDraft={(text) => editTextDraft({ text })} visibility={draft.text.visibility} setVisibility={(visibility) => editTextDraft({ visibility })} textSaving={draft.textSaving} profileSaving={draft.profileSaving} onAddText={addText} onAddFiles={addFiles} onVisibility={setEvidenceVisibility} selected={selectedEvidence} onSelect={setSelectedEvidence} preview={preview} onPreview={previewImage} onSource={goToEvidence} onProfileSave={saveProfile} profile={draft.profile} setProfile={editProfileDraft} totalChars={totalTextChars} totalBytes={totalAttachmentBytes} settings={settings} />}
           {scenario && page === 'plans' && <PlansPage scenario={scenario} actions={activeActions} settings={settings} busy={busy || autoBusy} onAnalyze={() => runAnalysis()} onEvidence={goToEvidence} onComplete={completeAction} onDiscardStart={(action) => { setDiscardId(action.id); setDiscardReason(''); }} discardId={discardId} discardReason={discardReason} setDiscardReason={setDiscardReason} onDiscard={discardAction} onDiscardCancel={() => { setDiscardId(''); setDiscardReason(''); }} />}
           {scenario && page === 'history' && <HistoryPage scenario={scenario} history={historyActions} onRestore={restoreAction} onEvidence={goToEvidence} />}
           {page === 'settings' && <div className="settings-scroll" role="region" aria-label="接続と保存の設定" tabIndex={0}><SettingsPage settings={settings} onSettings={setSettings} onSaved={setSettings} onCodexStatus={receiveCodexStatus} codexStatus={codexStatus} onDataFolder={() => window.makua.showDataFolder()} onError={reportError} onDelete={deleteScenario} scenario={scenario} /></div>}
+          {scenario && sourceView && <SourcePanel view={sourceView} title={sourceName(scenario, sourceView.request.evidenceId)} onClose={() => sourceReader.current.close()} onPage={(number) => goToEvidence(sourceView.request.evidenceId, String(number))}/>}
         </main>
         {scenario && page !== 'settings' && <footer className="session-footer"><span>自動保存</span><span className="footer-dot">·</span><span>{scenario.evidence.length} 件の資料</span><span className="footer-dot">·</span><span>更新 {dateLabel(scenario.updatedAt)}</span>{settings.autoUpdate && <span className="footer-auto">自動更新 ON</span>}<button onClick={exportScenario}>バックアップを書き出す</button><button className="footer-delete" onClick={deleteScenario}>シナリオを削除</button></footer>}
       </div>
     </div>
   );
+}
+
+function quoteVerificationLabel(value?: string) {
+  return value === 'text_matched' ? 'テキスト照合済み' : value === 'image_unverified' ? '画像読取・引用未照合' : '旧形式・ページ未照合';
+}
+
+function SourcePanel({ view, title, onClose, onPage }: { view: SourceViewState; title: string; onClose: () => void; onPage: (page: number) => void }) {
+  const preview = view.preview;
+  const page = preview?.pdfPages.find((entry) => entry.pageNumber === preview.pageNumber);
+  return <section className="source-panel" role="region" aria-label="原本を確認">
+    <div className="source-panel-head"><div><span className="panel-kicker">原本を確認</span><h2>{preview?.title || title}</h2></div><button className="button button-light" onClick={onClose} aria-label="原本を閉じる">閉じる ×</button></div>
+    {view.verification && <p className="source-verification">引用：{quoteVerificationLabel(view.verification)}</p>}
+    {view.loading && <p role="status" className="muted-copy">原本を読み込み中…</p>}
+    {preview?.kind === 'pdf' && <div className="source-page-controls">
+      <button className="button button-light" disabled={view.loading || !preview.pageNumber || preview.pageNumber <= 1} onClick={() => onPage((preview.pageNumber || 1) - 1)}>前へ</button>
+      <label>p. <input key={preview.pageNumber} aria-label="原本のページ番号" type="number" min={1} max={preview.pageCount || undefined} defaultValue={preview.pageNumber || 1} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); onPage(Number(event.currentTarget.value)); } }}/></label>
+      <span>/ {preview.pageCount ?? '不明'}</span>
+      <button className="button button-light" disabled={view.loading || !preview.pageCount || !preview.pageNumber || preview.pageNumber >= preview.pageCount} onClick={() => onPage((preview.pageNumber || 1) + 1)}>次へ</button>
+    </div>}
+    {view.error && <p role="alert" className="source-error">{view.error}</p>}
+    {page && <p className={'source-page-state' + (page.extractionStatus === 'error' ? ' source-error' : '')}>このページ：{page.extractionStatus === 'success' ? '本文抽出あり' : page.extractionStatus === 'no_text' ? '本文抽出なし' : '本文抽出エラー'}{page.hasImages ? '・画像あり' : ''}{page.extractionMessage ? ' — ' + page.extractionMessage : ''}</p>}
+    {preview?.kind === 'pdf' && preview.extractionMessage && <p className="muted-copy">{preview.extractionMessage}</p>}
+    {preview?.dataUrl && <div className="source-original"><img src={preview.dataUrl} alt={preview.title + (preview.pageNumber ? ' 原本 p.' + preview.pageNumber : ' 原本')}/></div>}
+    {preview?.text && <details className="source-text" open={preview.kind === 'text' || Boolean(view.error)}><summary>{preview.kind === 'pdf' && !view.error ? 'このページの抽出本文' : '保存された原文'}</summary><pre className="raw-source">{preview.text}</pre></details>}
+    {!view.loading && preview && !view.error && !preview.dataUrl && !preview.text && <p className="muted-copy">表示できる本文はありません。</p>}
+  </section>;
 }
 
 function EmptyState({ onNew, onDemo }: { onNew: () => void; onDemo: () => void }) {
@@ -507,12 +548,12 @@ function SectionHeading({ overline, title, note }: { overline: string; title: st
   return <div className="section-heading"><div><div className="eyebrow">{overline}</div><h2>{title}</h2></div>{note && <p>{note}</p>}</div>;
 }
 
-function Citation({ scenario, id, onEvidence }: { scenario: Scenario; id: string; onEvidence: (id: string) => void }) {
+function Citation({ scenario, id, page, verification, onEvidence }: { scenario: Scenario; id: string; page?: string; verification?: string; onEvidence: OpenSource }) {
   const index = scenario.evidence.findIndex((item) => item.id === id);
   const source = savedAnalysisSources(scenario).find((item) => item.id === id);
-  if (source) return <button className="citation-chip" onClick={() => onEvidence(id)} title="解析に使った内容を開く">{source.title}　↗</button>;
+  if (source) return <button className="citation-chip" onClick={() => onEvidence(id, page, verification)} title="解析に使った内容を開く">{source.title}　↗</button>;
   if (index < 0) return <span className="citation-missing">資料なし</span>;
-  return <button className="citation-chip" onClick={() => onEvidence(id)} title="元の資料を開く">証拠 {String(index + 1).padStart(2, '0')}　↗</button>;
+  return <button className="citation-chip" onClick={() => onEvidence(id, page, verification)} title="同じ画面で原本を開く">証拠 {String(index + 1).padStart(2, '0')}{page ? '　p.' + page : ''}　↗</button>;
 }
 
 function Citations({ scenario, ids, onEvidence }: { scenario: Scenario; ids: string[]; onEvidence: (id: string) => void }) {
@@ -576,13 +617,14 @@ function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, on
   </div>;
 }
 
-function EventRow({ event, scenario, onEvidence }: { event: Scenario['analysis'] extends infer A ? any : never; scenario: Scenario; onEvidence: (id: string) => void }) {
+function EventRow({ event, scenario, onEvidence }: { event: EventRecord; scenario: Scenario; onEvidence: OpenSource }) {
+  const verification = event.quoteVerification || (/画像/.test(event.quoteOrigin || '') ? 'image_unverified' : 'legacy_text_matched');
   return <article className="event-row">
     <div className="event-time">{event.timeText || '時刻不明'}</div>
     <div className="event-main"><div className="event-line"><span className="event-type">{typeLabel(event.type)}</span><span className="event-people">{event.people?.length ? event.people.join(' ／ ') : '人物不明'}</span></div><p>{event.what}</p>
-      {event.quote && <blockquote>{event.quote}<small>{event.quoteOrigin || '原文一致は未検証'}</small></blockquote>}
+      {event.quote && <blockquote>{event.quote}<small>{quoteVerificationLabel(verification)}</small></blockquote>}
       {event.ambiguity && <div className="ambiguity-note"><span>?</span><span>要確認の曖昧さ</span> {event.ambiguity}</div>}
-      <div className="event-cite"><Citation scenario={scenario} id={event.sourceId} onEvidence={onEvidence}/>{event.page && <span>p. {event.page}</span>}<button className="text-button source-open" onClick={() => onEvidence(event.sourceId)}>原資料を開く ↗</button></div>
+      <div className="event-cite"><Citation scenario={scenario} id={event.sourceId} page={event.page} verification={verification} onEvidence={onEvidence}/><button className="text-button source-open" onClick={() => onEvidence(event.sourceId, event.page, verification)}>原本を開く ↗</button></div>
     </div>
   </article>;
 }
@@ -597,11 +639,11 @@ function ScenarioSetupForm({ scenario, onSave }: { scenario: Scenario; onSave: (
   return <div className="setup-reminder"><div className="setup-reminder-icon">✎</div><div><strong>シナリオ概要とあなたの目的を記録できます</strong><p>HOに書かれた役・目的は解析で読み取ります。別欄への補足は任意です。原資料は「資料を追加」へ保存します。</p></div></div>;
 }
 
-function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, setVisibility, textSaving, profileSaving, onAddText, onAddFiles, onVisibility, selected, onSelect, preview, onPreview, onProfileSave, profile, setProfile, totalChars, totalBytes, settings }: {
+function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, setVisibility, textSaving, profileSaving, onAddText, onAddFiles, onVisibility, selected, onSelect, preview, onPreview, onSource, onProfileSave, profile, setProfile, totalChars, totalBytes, settings }: {
   scenario: Scenario; title: string; setTitle: (value: string) => void; draft: string; setDraft: (value: string) => void; visibility: Visibility; setVisibility: (value: Visibility) => void;
   textSaving: boolean; profileSaving: boolean;
   onAddText: (event: FormEvent) => void; onAddFiles: () => void; onVisibility: (item: Evidence, value: Visibility) => void; selected: string; onSelect: (id: string) => void;
-  preview: string; onPreview: (item: Evidence) => void; onProfileSave: (event: FormEvent) => void; profile: { title: string; synopsis: string; role: string; goal: string; secret: string };
+  preview: string; onPreview: (item: Evidence) => void; onSource?: OpenSource; onProfileSave: (event: FormEvent) => void; profile: { title: string; synopsis: string; role: string; goal: string; secret: string };
   setProfile: (value: { title: string; synopsis: string; role: string; goal: string; secret: string }) => void; totalChars: number; totalBytes: number; settings: AppSettings;
 }) {
   return <div className="page-stack">
@@ -641,7 +683,7 @@ function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, 
           <div className="evidence-detail"><p className="muted-copy">解析に使った内容</p><pre className="raw-source">{source.extractedText}</pre></div>
         </article>)}
         <div className="evidence-list-head"><div><span className="eyebrow">SAVED MATERIALS</span><h2>資料一覧 <span>{scenario.evidence.length}</span></h2></div><span className="scope-reminder">公開範囲は資料ごと</span></div>
-        {scenario.evidence.length ? <div className="evidence-cards">{scenario.evidence.map((item, index) => <EvidenceCard key={item.id} item={item} index={index} selected={selected === item.id} preview={preview} onSelect={() => onSelect(selected === item.id ? '' : item.id)} onVisibility={onVisibility} onPreview={onPreview}/>)}</div> : <div className="no-evidence"><div className="no-evidence-mark">＋</div><strong>まだ資料はありません</strong><p>テキストを貼り付けるか、PDFやスクリーンショットを追加します。</p></div>}
+        {scenario.evidence.length ? <div className="evidence-cards">{scenario.evidence.map((item, index) => <EvidenceCard key={item.id} item={item} index={index} selected={selected === item.id} preview={preview} onSelect={() => onSelect(selected === item.id ? '' : item.id)} onVisibility={onVisibility} onPreview={onPreview} onSource={onSource} provider={settings.provider}/>)}</div> : <div className="no-evidence"><div className="no-evidence-mark">＋</div><strong>まだ資料はありません</strong><p>テキストを貼り付けるか、PDFやスクリーンショットを追加します。</p></div>}
         <div className="preserve-note"><span>◈</span><p><strong>原本は要約で置き換わりません。</strong><br/>AIの概要・イベント表は参照用の索引です。原文と添付ファイルは別に保存し続けます。</p></div>
       </div>
     </div>
@@ -652,14 +694,20 @@ function VisibilitySelect({ value, onChange }: { value: Visibility; onChange: (v
   return <label className="visibility-field"><span>この情報を知っている範囲</span><select value={value} onChange={(event) => onChange(event.target.value as Visibility)}><option value="unknown">公開状況不明</option><option value="shared">全体公開</option><option value="private">自分だけ</option></select></label>;
 }
 
-function EvidenceCard({ item, index, selected, preview, onSelect, onVisibility, onPreview }: { item: Evidence; index: number; selected: boolean; preview: string; onSelect: () => void; onVisibility: (item: Evidence, value: Visibility) => void; onPreview: (item: Evidence) => void }) {
+function EvidenceCard({ item, index, selected, preview, onSelect, onVisibility, onPreview, onSource, provider }: { item: Evidence; index: number; selected: boolean; preview: string; onSelect: () => void; onVisibility: (item: Evidence, value: Visibility) => void; onPreview: (item: Evidence) => void; onSource?: OpenSource; provider?: AppSettings['provider'] }) {
   const kindLabel = item.kind === 'pdf' ? 'PDF' : item.kind === 'image' ? 'IMAGE' : 'TEXT';
+  const extractionError = item.extractionStatus === 'error' || item.extractionStatus === 'partial';
   return <article id={'evidence-' + item.id} className={'evidence-card ' + (selected ? 'selected' : '')}>
     <div className="evidence-card-head"><div className={'file-mark file-' + item.kind}>{item.kind === 'pdf' ? 'PDF' : item.kind === 'image' ? '▧' : 'T'}</div><div className="evidence-title-block"><div className="evidence-title-row"><span className="evidence-index">{String(index + 1).padStart(2, '0')}</span><strong>{item.title}</strong><span className="kind-label">{kindLabel}</span></div><span className="evidence-date">追加 {dateLabel(item.createdAt)}{item.byteSize ? '　·　' + bytesLabel(item.byteSize) : ''}</span></div>
       <div className="evidence-scope"><ScopeBadge visibility={item.visibility}/><select aria-label="公開範囲" value={item.visibility} onChange={(event) => onVisibility(item, event.target.value as Visibility)}><option value="unknown">不明</option><option value="shared">公開</option><option value="private">自分だけ</option></select></div>
     </div>
-    {item.kind === 'pdf' && <div className={'extract-status ' + (item.extractionStatus === 'success' ? 'extract-ok' : 'extract-warning')}><span>{item.extractionStatus === 'success' ? '✓' : '!'}</span>{item.extractionMessage || (item.extractionStatus === 'success' ? 'PDFからテキストを抽出しました。' : 'PDF内の文字を抽出できませんでした。')}</div>}
+    {item.kind === 'pdf' && <>
+      <div className={'extract-status ' + (extractionError ? 'extract-warning' : 'extract-ok')}><span>{extractionError ? '!' : '·'}</span>{item.extractionMessage || (item.pdfPages ? 'ページ別の抽出状態を保存しました。' : '旧形式の抽出情報。原本を開くとページ別の状態を確認できます。')}</div>
+      {provider === 'ollama' && <p className="image-note">Ollamaには抽出本文だけを送ります。PDF画像は解析対象外です。</p>}
+      {item.pdfPages && <details className="pdf-page-states"><summary>ページ別の状態（{item.pdfPageCount ?? 'ページ数不明'}）</summary><ol>{item.pdfPages.map((page) => <li key={page.pageNumber}>{onSource ? <button className="text-button" onClick={() => onSource(item.id, String(page.pageNumber))}>p.{page.pageNumber}</button> : 'p.' + page.pageNumber}　{page.extractionStatus === 'success' ? '本文抽出あり' : page.extractionStatus === 'no_text' ? '本文抽出なし' : '本文抽出エラー'}{page.hasImages ? '・画像あり' : ''}{page.extractionMessage ? ' — ' + page.extractionMessage : ''}</li>)}</ol></details>}
+    </>}
     {item.kind === 'image' && <div className="image-note">画像本体を保存しました。OpenAI解析では画像として送ります。Ollamaでは選んだモデルがVision対応か未確認です。</div>}
+    {onSource && <button className="text-button evidence-source-open" onClick={() => onSource(item.id)}>同じ画面で原本を開く ↗</button>}
     <button className="evidence-toggle" onClick={onSelect}>{selected ? '資料の詳細を閉じる' : item.extractedText ? '抽出テキスト・原文を表示' : '原本の詳細を表示'} <span>{selected ? '−' : '+'}</span></button>
     {selected && <div className="evidence-detail">
       {item.kind === 'image' && <div className="preview-holder">{preview ? <img src={preview} alt={item.title + ' のプレビュー'}/> : <button className="button button-light" onClick={() => onPreview(item)}>画像をプレビュー</button>}</div>}

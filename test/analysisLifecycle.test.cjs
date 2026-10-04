@@ -82,8 +82,9 @@ test('image-derived event quotes are labelled as unverified', () => {
   const base = fixture();
   base.evidence = [{ id: 'ev-1', title: 'screenshot', kind: 'image' }];
   const output = response({ events: [{ timeText: '夕方', people: ['X?'], what: 'メッセージが表示されている。', type: 'recorded', sourceId: 'ev-1', page: '', quote: 'Aにいた', ambiguity: '人物の呼び名が一致するか不明。' }] });
-  const saved = applyAnalysis(base, output, 4);
-  assert.match(saved.analysis.events[0].quoteOrigin, /未検証/);
+  assert.throws(() => applyAnalysis(base, output, 4), /原本/);
+  const saved = applyAnalysis(base, output, 4, undefined, { sourceInputs: { 'ev-1': { originalAvailable: true, imageSent: true } } });
+  assert.match(saved.analysis.events[0].quoteOrigin, /引用未照合/);
 });
 
 test('facts require at least one existing source, while hypotheses and actions allow no sources', () => {

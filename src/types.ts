@@ -1,5 +1,27 @@
 export type Visibility = 'shared' | 'private' | 'unknown';
 
+export type PdfPage = {
+  pageNumber: number;
+  text: string;
+  extractionStatus: 'success' | 'no_text' | 'error';
+  extractionMessage: string;
+  readable: boolean;
+  hasImages: boolean | null;
+  hasNonTextContent: boolean | null;
+};
+
+export type SourcePreview = {
+  title: string;
+  kind: Evidence['kind'];
+  text: string;
+  dataUrl: string;
+  pageNumber: number | null;
+  pageCount: number | null;
+  pdfPages: PdfPage[];
+  extractionMessage: string;
+  error?: string;
+};
+
 export type Evidence = {
   id: string;
   title: string;
@@ -9,6 +31,10 @@ export type Evidence = {
   attachmentPath?: string;
   extractionStatus?: string;
   extractionMessage?: string;
+  // Optional for pre-page-metadata saved evidence.
+  pdfMetadataVersion?: number;
+  pdfPageCount?: number | null;
+  pdfPages?: PdfPage[];
   byteSize?: number;
   visibility: Visibility;
   mimeType?: string;
@@ -25,6 +51,9 @@ export type EventRecord = {
   quote: string;
   ambiguity: string;
   quoteOrigin?: string;
+  quoteSource?: 'text' | 'image';
+  // App-owned; never a model-provided verification claim.
+  quoteVerification?: 'text_matched' | 'image_unverified' | 'legacy_text_matched';
 };
 
 export type Action = {
@@ -164,6 +193,7 @@ declare global {
       addPastedImage: (value: Record<string, unknown>) => Promise<Scenario>;
       setVisibility: (value: Record<string, unknown>) => Promise<Scenario>;
       previewImage: (value: Record<string, unknown>) => Promise<string>;
+      readSource: (value: { id: string; evidenceId: string; page?: string }) => Promise<SourcePreview>;
       completeAction: (value: Record<string, unknown>) => Promise<Scenario>;
       discardAction: (value: Record<string, unknown>) => Promise<Scenario>;
       restoreAction: (value: Record<string, unknown>) => Promise<Scenario>;

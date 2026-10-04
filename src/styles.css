@@ -285,6 +285,21 @@ button:disabled { cursor: default; opacity: .62; }
 .attachment-path { padding-top: 8px; color: #9ba49c; font-size: 8px; }
 .preview-holder { display: grid; justify-items: center; max-height: 390px; overflow: auto; padding: 8px; border: 1px solid #edede5; background: #fafaf6; }
 .preview-holder img { max-width: 100%; max-height: 360px; object-fit: contain; }
+.source-panel { position: fixed; z-index: 20; top: 80px; right: 20px; bottom: 48px; width: min(700px, calc(100vw - 40px)); overflow: auto; padding: 20px; border: 1px solid #cbd7cb; border-radius: 8px; background: #fffefa; box-shadow: 0 10px 50px rgba(35,56,43,.24); }
+.source-panel-head { display: flex; gap: 16px; justify-content: space-between; align-items: start; }
+.source-panel-head h2 { margin: 6px 0 12px; font-family: var(--font-serif); font-size: 17px; overflow-wrap: anywhere; }
+.source-panel-head button { flex-shrink: 0; }
+.source-verification, .source-page-state { color: #597064; font-size: 11px; line-height: 1.7; }
+.source-page-controls { display: flex; align-items: center; gap: 10px; margin: 12px 0; font-size: 12px; }
+.source-page-controls input { width: 65px; padding: 5px; border: 1px solid #cbd7cb; border-radius: 4px; }
+.source-error { color: #9f593f; background: #faf2eb; padding: 9px; border-radius: 4px; font-size: 11px; line-height: 1.8; }
+.source-original img { display: block; width: 100%; height: auto; border: 1px solid #e5e5dd; }
+.source-text { margin-top: 12px; font-size: 11px; }
+.source-text summary { cursor: pointer; margin-bottom: 8px; }
+.pdf-page-states { margin: 8px 12px; font-size: 10px; color: #718278; }
+.pdf-page-states summary { cursor: pointer; }
+.pdf-page-states ol { display: grid; gap: 6px; padding-left: 24px; max-height: 200px; overflow: auto; }
+.evidence-source-open { margin: 3px 12px 9px; font-size: 10px; }
 .no-evidence { min-height: 218px; display: grid; justify-items: center; align-content: center; padding: 20px; border: 1px dashed #dfe2d9; border-radius: 7px; background: rgba(255,254,250,.65); text-align: center; }
 .no-evidence-mark { width: 35px; height: 35px; margin-bottom: 9px; display: grid; place-items: center; border: 1px solid #dce3d9; border-radius: 50%; color: #829785; font-size: 19px; }
 .no-evidence strong { color: #597064; font-family: var(--font-serif); font-size: 13px; font-weight: 500; }

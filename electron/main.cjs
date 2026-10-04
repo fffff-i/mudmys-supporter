@@ -12,6 +12,8 @@ const { getCaseDir } = require('../shared/storage.cjs');
 const { createSerialLock } = require('../shared/serialLock.cjs');
 const { CodexAppServerClient, CodexAppServerError, buildCodexEnvironment } = require('./codexAppServer.cjs');
 const { prepareCodexInput, cleanupCodexInput, buildCodexDeveloperInstructions, parseStructuredResult } = require('./codexInput.cjs');
+const { extractPdfDocument, renderPdfPage } = require('./pdfDocuments.cjs');
+const { hasPdfMetadata, parsePdfPage, pdfTextForInput, sourceInputsForRows } = require('../shared/pdfSources.cjs');
 const { accountEligibility, sanitizeCodexModels, chooseCodexModel, chooseCodexEffort, codexModelSupportsImages, summarizeRateLimits } = require('../shared/codexProvider.cjs');
 
 app.setName('幕間ノート');
@@ -40,7 +42,7 @@ const ANALYSIS_SCHEMA = {
   properties: {
     overview: { type: 'string' },
     flow: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['moment', 'summary', 'evidenceIds'], properties: { moment: { type: 'string' }, summary: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
-    events: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['timeText', 'people', 'what', 'type', 'sourceId', 'page', 'quote', 'ambiguity'], properties: { timeText: { type: 'string' }, people: { type: 'array', items: { type: 'string' } }, what: { type: 'string' }, type: { type: 'string', enum: ['observed', 'reported', 'statement', 'recorded', 'inference', 'unknown'] }, sourceId: { type: 'string' }, page: { type: 'string' }, quote: { type: 'string' }, ambiguity: { type: 'string' } } } },
+    events: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['timeText', 'people', 'what', 'type', 'sourceId', 'page', 'quote', 'quoteSource', 'ambiguity'], properties: { timeText: { type: 'string' }, people: { type: 'array', items: { type: 'string' } }, what: { type: 'string' }, type: { type: 'string', enum: ['observed', 'reported', 'statement', 'recorded', 'inference', 'unknown'] }, sourceId: { type: 'string' }, page: { type: 'string', description: 'PDFは原本の物理ページ番号を1始まりの数字で指定。その他は空文字。' }, quote: { type: 'string' }, quoteSource: { type: 'string', enum: ['text', 'image'], description: '抽出本文の引用はtext、抽出に含まれない画像領域の読取はimage。照合状態はアプリが決定する。' }, ambiguity: { type: 'string' } } } },
     facts: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'evidenceIds'], properties: { statement: { type: 'string' }, evidenceIds: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 }, description: '今回送信された実在する出典。事実は出典を1件以上必要とする。' } } } },
     hypotheses: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'why', 'evidenceIds', 'assumptions'], properties: { statement: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '想定した未公開情報など、未確認の条件。条件がなければ空配列。' } } } },
     unknowns: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['question', 'why', 'evidenceIds'], properties: { question: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
@@ -55,6 +57,7 @@ const SYSTEM_PROMPT = [
   '根拠に使えるのは、今回渡された資料IDと内容だけです。外部サイトを検索せず、既知シナリオの正解・犯人・秘密を補いません。',
   '直接資料に書かれた/見える内容を事実、読み取りや解釈を仮説、まだ決められない点を未確認事項に分けます。確率や犯人らしさの数値は出しません。公開範囲（全体公開・自分だけ・不明）は、事実/仮説/未確認と別の情報として扱います。',
   'イベント列では、元の資料の粒度を保って時刻表現、誰が/誰と、何があった/何を話したかを記録します。原文の時間表現をそのまま残し、「8時前」「夕方」「その後」等を勝手に正規化しない。同じ人物か不明な呼称を統合しない。主語省略、伝聞と直接観察、否定、期間や順序の曖昧さを勝手に補わない。各イベントに資料ID、ページ番号（不明なら空文字）、短い原文引用、曖昧な点を入れます。叙述トリックと断定せず「確認が必要な曖昧点」として扱います。',
+  'PDF引用のpageには原本の物理ページ番号を1始まりの数字だけで必ず入れます。印刷されたページラベルとは区別し、複数ページや不明なページを指定しません。テキスト資料・単独画像のpageは空文字です。quoteSourceは抽出本文の引用ならtext、抽出に含まれない画像領域を読んだ引用ならimageです。同じページの本文と画像も区別します。textの引用は該当ページの抽出原文をそのまま使い、不一致をimageへ変更して回避しません。PDFページ画像を送っていない接続先ではPDFのimage引用を作りません。照合済みかどうかは申告せず、アプリの検証に任せます。',
   '証言の存在と証言内容の真偽を分けます。例「Xが20時にAにいたと発言した」は発言としての事実ですが、「Xが20時にAにいた」は独立した裏付けがない限り事実ではありません。事実欄には「Xがそう発言した」と記し、発言内容そのものは仮説/未確認のままにします。',
   '送信されたHO（ハンドアウト）に役・目的が書かれていれば読み取って利用し、別欄への再入力を前提にしません。役プロフィールは任意の補足です。どちらにもなければ役柄や目的を決めつけず、一般的な確認行動を提案します。秘密を不用意に開示しないよう、行動ごとに秘密が漏れるリスクを短く示します。',
   '各方針は次に取る具体的行動の順番です。誰へ何を聞く/発言するか、質問または短い発言例、目的への寄与を含めます。未公開の鍵・別の出入口・協力者などを一般的な可能性として想定できますが、資料にない人物名を登場人物として作らず「鍵の管理者」「協力者がいるなら」等と表現します。',
@@ -269,23 +272,7 @@ function detectFileType(filePath) {
   return null;
 }
 
-async function extractPdfText(buffer) {
-  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-  const task = pdfjs.getDocument({ data: new Uint8Array(buffer), isEvalSupported: false, useSystemFonts: true, verbosity: 0 });
-  const pdf = await task.promise;
-  const pages = [];
-  const pageCount = pdf.numPages;
-  for (let number = 1; number <= pageCount; number += 1) {
-    const page = await pdf.getPage(number);
-    const content = await page.getTextContent();
-    const text = content.items.map((item) => (item && typeof item.str === 'string' ? item.str : '')).filter(Boolean).join(' ');
-    if (text.trim()) pages.push('[p.' + number + '] ' + text);
-  }
-  await task.destroy();
-  return { text: pages.join('\n\n'), pages: pageCount };
-}
-
-async function storeEvidence(caseRecord, bytes, originalName, kind, mimeType, extractedText, extractionStatus, extractionMessage) {
+async function storeEvidence(caseRecord, bytes, originalName, kind, mimeType, extractedText, extractionStatus, extractionMessage, pdfMetadata = {}) {
   const id = randomUUID();
   const fileName = safeName(originalName);
   const relativePath = path.join('attachments', id + '_' + fileName);
@@ -304,7 +291,8 @@ async function storeEvidence(caseRecord, bytes, originalName, kind, mimeType, ex
     extractionMessage: extractionMessage || '',
     byteSize: bytes.length,
     visibility: 'unknown',
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    ...pdfMetadata
   };
 }
 
@@ -354,22 +342,30 @@ function noSecrets(message, key) {
   return text.slice(0, 500);
 }
 
-async function evidenceForRequest(caseRecord, includeRoleProfile) {
+async function evidenceForRequest(caseRecord, includeRoleProfile, provider) {
   let attachmentBytes = 0;
   let textCharacters = (caseRecord.synopsis || '').length;
   const rows = [];
-  for (const item of caseRecord.evidence || []) {
-    // Fixed source IDs are supplied only by the app, according to their scope.
+  for (const savedItem of caseRecord.evidence || []) {
+    let item = savedItem;
+    // Fixed sources are supplied only by the app, according to their scope.
     if (item.id === SYNOPSIS_SOURCE_ID || item.id === ROLE_PROFILE_SOURCE_ID) continue;
+    let bytes;
+    try { bytes = item.attachmentPath ? await fs.readFile(attachmentPath(caseRecord.id, item.attachmentPath)) : Buffer.alloc(0); }
+    catch { throw new Error('「' + item.title + '」の原本を読み取れません。保存済みの本文と前回結果は保持しています。'); }
+    if (item.kind === 'pdf' && !hasPdfMetadata(item) && bytes.length) {
+      const metadata = await extractPdfDocument(bytes);
+      item = { ...item, ...metadata, extractedText: metadata.extractedText || item.extractedText || '' };
+    }
+    if ((item.kind === 'pdf' || item.kind === 'image') && !bytes.length) throw new Error('「' + item.title + '」の原本がありません。保存済みの本文と前回結果は保持しています。');
     const body = item.extractedText || '';
-    textCharacters += body.length;
-    const bytes = item.attachmentPath ? await fs.readFile(attachmentPath(caseRecord.id, item.attachmentPath)) : Buffer.alloc(0);
+    textCharacters += (item.kind === 'pdf' ? pdfTextForInput(item, provider !== 'ollama') : body).length;
     attachmentBytes += bytes.length;
     rows.push({ item, bytes, text: body, fullPath: item.attachmentPath ? attachmentPath(caseRecord.id, item.attachmentPath) : '' });
   }
   if (includeRoleProfile === true) textCharacters += JSON.stringify(caseRecord.roleProfile || {}).length;
-  if (attachmentBytes > MAX_REQUEST_FILE_BYTES) throw new Error('資料の合計サイズが40MBを超えています。資料を分けるか、不要な添付を別シナリオへ移してください。資料は切り捨てていません。');
-  if (textCharacters > MAX_ANALYSIS_TEXT_CHARS) throw new Error('解析対象テキストが30万文字を超えています。資料は切り捨てていません。要点を別シナリオに整理してから解析してください。');
+  if (attachmentBytes > MAX_REQUEST_FILE_BYTES) throw new Error('資料の合計がこのアプリの解析上限40MiBを超えています。資料を切り捨てず解析を停止しました。原本と前回結果は保持しています。');
+  if (textCharacters > MAX_ANALYSIS_TEXT_CHARS) throw new Error('解析対象テキストがこのアプリの上限30万文字を超えています。本文を切り詰めず解析を停止しました。原本と前回結果は保持しています。');
   return { rows, attachmentBytes, textCharacters };
 }
 
@@ -398,7 +394,7 @@ async function openAiRequest(caseRecord, preferences, requestData) {
     content.push({ type: 'input_text', text: renderEvidenceLabel(item) });
     if (item.kind === 'pdf') {
       content.push({ type: 'input_file', filename: safeName(item.originalName), file_data: 'data:application/pdf;base64,' + bytes.toString('base64'), detail: 'auto' });
-      if (text) content.push({ type: 'input_text', text: '[このPDFからローカル抽出したテキスト]\n' + text });
+      content.push({ type: 'input_text', text: pdfTextForInput(item, true) });
     } else if (item.kind === 'image') {
       content.push({ type: 'input_image', image_url: 'data:' + item.mimeType + ';base64,' + bytes.toString('base64'), detail: 'auto' });
     } else {
@@ -420,7 +416,7 @@ async function openAiRequest(caseRecord, preferences, requestData) {
   try { output = JSON.parse(result.output_text || ''); }
   catch { throw new Error('AIから解析JSONを受け取れませんでした。前回の状況と方針はそのまま残しています。'); }
   output.provider = 'OpenAI / ' + (preferences.model || 'gpt-6-luna');
-  return { output, usage: result.usage || null };
+  return { output, usage: result.usage || null, sourceInputs: sourceInputsForRows(requestData.rows, 'openai') };
 }
 
 async function ollamaRequest(caseRecord, preferences, requestData) {
@@ -432,7 +428,7 @@ async function ollamaRequest(caseRecord, preferences, requestData) {
   for (const { item, bytes, text } of requestData.rows) {
     userText += '\n\n' + renderEvidenceLabel(item) + '\n';
     if (item.kind === 'image') images.push(bytes.toString('base64'));
-    else if (item.kind === 'pdf' && !text.trim()) userText += '[このローカルモデル用にはPDF本文を抽出できませんでした。ページ画像も送っていません。]';
+    else if (item.kind === 'pdf') userText += pdfTextForInput(item, false);
     else userText += text || '[本文なし]';
   }
   const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
@@ -450,7 +446,8 @@ async function ollamaRequest(caseRecord, preferences, requestData) {
   try { output = JSON.parse(payload.message && payload.message.content || ''); }
   catch { throw new Error('Ollamaから解析JSONを受け取れませんでした。前回の状況と方針はそのまま残しています。'); }
   output.provider = 'Ollama / ' + preferences.ollamaModel.trim() + (images.length ? '（画像を送信、モデルの対応可否は未確認）' : '');
-  return { output, usage: payload.prompt_eval_count != null ? { input_tokens: payload.prompt_eval_count, output_tokens: payload.eval_count || 0 } : null };
+  return { output, usage: payload.prompt_eval_count != null ? { input_tokens: payload.prompt_eval_count, output_tokens: payload.eval_count || 0 } : null,
+    sourceInputs: sourceInputsForRows(requestData.rows, 'ollama') };
 }
 
 async function codexRequest(caseRecord, preferences, requestData, signal) {
@@ -487,7 +484,8 @@ async function codexRequest(caseRecord, preferences, requestData, signal) {
       });
       const output = parseStructuredResult(result.text);
       output.provider = 'Codex（ChatGPTの契約枠） / ' + model.displayName;
-      return { output, usage: null, model: model.id, pdfPages: prepared.pdfPages, imageBytes: prepared.imageBytes };
+      return { output, usage: null, model: model.id, pdfPages: prepared.pdfPages, imageBytes: prepared.imageBytes,
+        sourceInputs: sourceInputsForRows(requestData.rows, 'codex', prepared.pdfPageInputs) };
     } finally {
       await cleanupCodexInput(prepared);
     }
@@ -512,7 +510,7 @@ async function analyzeCase(id, expectedRevision) {
   let requestData = { rows: [], attachmentBytes: 0, textCharacters: 0 };
   try {
     if (codexController && codexController.signal.aborted) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
-    requestData = await evidenceForRequest(started, preferences.includeRoleProfile);
+    requestData = await evidenceForRequest(started, preferences.includeRoleProfile, preferences.provider);
     if (codexController && codexController.signal.aborted) return { status: 'cancelled', message: 'Codex解析をキャンセルしました。保存済みの資料と前回結果は保持されています。' };
     const response = preferences.provider === 'openai'
       ? await openAiRequest(started, preferences, requestData)
@@ -523,9 +521,14 @@ async function analyzeCase(id, expectedRevision) {
       const latest = await readCase(id);
       if (latest.revision !== expectedRevision) return { status: 'stale', message: '解析中にシナリオが更新されたため、古い結果は保存しませんでした。' };
       const output = response.output;
-      const updated = applyAnalysis(latest, output, expectedRevision, new Date().toISOString(), {
+      // Persist automatic legacy PDF metadata upgrades with this result, under
+      // the same revision guard as the input actually sent.
+      const sentItems = new Map(requestData.rows.map(({ item }) => [item.id, item]));
+      const inputRecord = { ...latest, evidence: latest.evidence.map((item) => sentItems.get(item.id) || item) };
+      const updated = applyAnalysis(inputRecord, output, expectedRevision, new Date().toISOString(), {
         includeRoleProfile: preferences.includeRoleProfile === true,
-        evidenceIds: requestData.rows.map(({ item }) => item.id)
+        evidenceIds: requestData.rows.map(({ item }) => item.id),
+        sourceInputs: response.sourceInputs
       });
       updated.analysis.usage = response.usage;
       updated.analysis.provider = output.provider;
@@ -770,24 +773,20 @@ ipcMain.handle('scenario:add-files', async (_event, id) => {
       const type = detectFileType(sourcePath);
       if (!type) continue;
       const stat = await fs.stat(sourcePath);
-      if (stat.size > MAX_FILE_BYTES) throw new Error(safeName(sourcePath) + ' は20MBを超えています。ファイルを分けてください。');
+      if (stat.size > MAX_FILE_BYTES) throw new Error(safeName(sourcePath) + ' はこのアプリの取り込み上限20MiBを超えています。取り込みを停止しました。');
       const buffer = await fs.readFile(sourcePath);
       let extracted = '';
       let status = type.kind === 'pdf' ? 'error' : type.kind === 'text' ? 'success' : 'not_applicable';
       let message = '';
+      let pdfMetadata = {};
       if (type.kind === 'text') extracted = buffer.toString('utf8').replace(/^\uFEFF/, '');
       if (type.kind === 'pdf') {
-        try {
-          const result = await extractPdfText(buffer);
-          extracted = result.text;
-          status = extracted.trim().length >= 10 ? 'success' : 'no_text';
-          message = status === 'no_text' ? '文字を抽出できませんでした。スキャンPDFの可能性があります。' : result.pages + 'ページから文字を抽出しました。';
-        } catch (error) {
-          status = 'error';
-          message = 'PDFの文字を抽出できませんでした。AI対応時もページ画像を送れる設定が必要です。';
-        }
+        pdfMetadata = await extractPdfDocument(buffer);
+        extracted = pdfMetadata.extractedText;
+        status = pdfMetadata.extractionStatus;
+        message = pdfMetadata.extractionMessage;
       }
-      additions.push(await storeEvidence(current, buffer, path.basename(sourcePath), type.kind, type.mimeType, extracted, status, message));
+      additions.push(await storeEvidence(current, buffer, path.basename(sourcePath), type.kind, type.mimeType, extracted, status, message, pdfMetadata));
     }
     if (!additions.length) return current;
     return { ...current, evidence: [...current.evidence, ...additions], revision: current.revision + 1, updatedAt: new Date().toISOString() };
@@ -821,6 +820,34 @@ ipcMain.handle('scenario:preview-image', async (_event, payload) => {
   if (!item || item.kind !== 'image' || !item.attachmentPath) throw new Error('画像資料が見つかりません。');
   const bytes = await fs.readFile(attachmentPath(record.id, item.attachmentPath));
   return 'data:' + item.mimeType + ';base64,' + bytes.toString('base64');
+});
+ipcMain.handle('scenario:read-source', async (_event, payload) => {
+  const record = await readCase(payload.id);
+  const item = record.evidence.find((entry) => entry.id === payload.evidenceId) ||
+    record.analysis?.sources?.find((entry) => entry.id === payload.evidenceId);
+  if (!item) throw new Error('資料が見つかりません。');
+  const base = { title: item.title, kind: item.kind, text: item.extractedText || '', dataUrl: '', pageNumber: null, pageCount: null, pdfPages: [], extractionMessage: item.extractionMessage || '' };
+  if (item.kind === 'text') return base;
+  let bytes;
+  try {
+    if (!item.attachmentPath) throw new Error('Missing attachment');
+    bytes = await fs.readFile(attachmentPath(record.id, item.attachmentPath));
+    if (!bytes.length) throw new Error('Empty attachment');
+  } catch { return { ...base, error: '原本を読み取れません。保存済みの本文は下に表示します。' }; }
+  if (item.kind === 'image') return { ...base, dataUrl: 'data:' + item.mimeType + ';base64,' + bytes.toString('base64') };
+  const metadata = hasPdfMetadata(item) ? item : await extractPdfDocument(bytes);
+  const number = payload.page === undefined || payload.page === '' ? 1 : parsePdfPage(payload.page);
+  const result = { ...base, pageNumber: number, pageCount: metadata.pdfPageCount, pdfPages: metadata.pdfPages,
+    text: metadata.pdfPages.find((page) => page.pageNumber === number)?.text ?? (metadata.pdfPageCount === null ? base.text : ''), extractionMessage: metadata.extractionMessage };
+  if (!number) return { ...result, error: 'PDFのページ番号が不正です。' };
+  try {
+    const rendered = await renderPdfPage(bytes, number);
+    return { ...result, pageNumber: rendered.pageNumber, pageCount: rendered.pageCount, dataUrl: rendered.dataUrl,
+      text: metadata.pdfPages.find((page) => page.pageNumber === number)?.text || '' };
+  } catch (error) {
+    const message = /このアプリ|指定したPDFページ|ページ番号/.test(error.message) ? error.message : 'PDFページの原本を表示できませんでした。';
+    return { ...result, error: message };
+  }
 });
 ipcMain.handle('scenario:complete-action', async (_event, payload) => mutateCase(payload.id, (current) => {
   const actions = current.analysis && current.analysis.actions || [];
