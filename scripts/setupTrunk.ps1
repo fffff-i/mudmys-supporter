@@ -59,7 +59,15 @@ try {
         try { Invoke-RestMethod @taskRequest }
         catch {
             $taskStatus = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'unavailable' }
-            throw "GitHub $Method $Suffix failed (HTTP $taskStatus)."
+            $taskDetail = ''
+            if ($_.ErrorDetails.Message) {
+                try {
+                    $taskApiError = $_.ErrorDetails.Message | ConvertFrom-Json
+                    $taskDetail = ': ' + $taskApiError.message
+                    if ($taskApiError.errors) { $taskDetail += ' ' + ($taskApiError.errors | ConvertTo-Json -Depth 10 -Compress) }
+                } catch { $taskDetail = '' }
+            }
+            throw "GitHub $Method $Suffix failed (HTTP $taskStatus)$taskDetail"
         }
     }
 
