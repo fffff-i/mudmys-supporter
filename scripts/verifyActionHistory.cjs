@@ -188,7 +188,7 @@ async function fill(selector, value) {
 }
 async function page(index) {
   await evaluate(`document.querySelectorAll('.side-nav-item')[${index}].click()`);
-  await until(() => evaluate(index === 2 ? "Boolean(document.querySelector('.plans-context'))" : index === 3 ? "Boolean(document.querySelector('.history-list'))" : "Boolean(document.querySelector('.overview-grid'))"), 'page ' + index);
+  await until(() => evaluate(index === 2 ? "Boolean(document.querySelector('.plans-context'))" : index === 3 ? "Boolean(document.querySelector('.history-list'))" : "Boolean(document.querySelector('.play-grid'))"), 'page ' + index);
 }
 async function select(name, index = 3) {
   await evaluate(`(() => { const button=Array.from(document.querySelectorAll('.scenario-switch')).find(e=>e.querySelector('.scenario-title').textContent===${JSON.stringify(name)}); if(!button) throw new Error('Missing scenario'); button.click(); })()`);

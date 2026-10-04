@@ -1,7 +1,8 @@
-import { FormEvent, ClipboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, ClipboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { createSelectionGuard } from '../shared/selectionGuard.mjs';
 import { createAnalysisUpdater, type AnalysisUpdateState } from '../shared/analysisUpdater.mjs';
 import { createScenarioDrafts, type ProfileDraft, type TextDraft, type DraftCandidate, type EvidenceEdit } from '../shared/scenarioDrafts.mjs';
+import { partitionFacts } from '../shared/factDisplay.mjs';
 import { evidenceBody, evidenceUsage } from '../shared/evidence.mjs';
 import { createSourceReader, type SourceViewState } from '../shared/sourceReader.mjs';
 import type { Action, ActionNotes, AppSettings, CodexConnectionStatus, EventRecord, Evidence, Scenario, Visibility } from './types';
@@ -9,9 +10,9 @@ import type { Action, ActionNotes, AppSettings, CodexConnectionStatus, EventReco
 type Page = 'overview' | 'evidence' | 'plans' | 'history' | 'settings';
 type OpenSource = (id: string, page?: string, verification?: string, analysisIndex?: number, scope?: { actionId?: string; current?: boolean }) => void;
 const PAGES: { id: Page; label: string; mark: string }[] = [
-  { id: 'overview', label: '現在地', mark: '○' },
-  { id: 'evidence', label: '資料を追加', mark: '＋' },
-  { id: 'plans', label: '次の一手', mark: '↗' },
+  { id: 'overview', label: '現在地・プレイ', mark: '○' },
+  { id: 'evidence', label: '資料一覧・編集', mark: '＋' },
+  { id: 'plans', label: '行動一覧', mark: '↗' },
   { id: 'history', label: '方針の履歴', mark: '↶' }
 ];
 const DEFAULT_SETTINGS: AppSettings = {
@@ -546,6 +547,15 @@ function App() {
     void sourceReader.current.open({ id: scenario.id, evidenceId: id, page: sourcePage, analysisIndex, ...scope }, verification);
   };
 
+  const intakeProps: IntakeProps | null = draft ? {
+    title: draft.text.title, setTitle: (title) => editTextDraft({ title }),
+    draft: draft.text.text, setDraft: (text) => editTextDraft({ text }),
+    visibility: draft.text.visibility, setVisibility: (visibility) => editTextDraft({ visibility }),
+    textSaving: draft.textSaving, onAddText: addText, onAddFiles: addFiles,
+    candidates: draft.candidates, onRemoveCandidate: removeCandidate, onPaste: handlePasteImage,
+    totalChars: usage.textCharacters, totalBytes: usage.attachmentBytes, retainedBytes: usage.retainedBytes, settings
+  } : null;
+
   if (loading) return <div className="loading-screen"><div className="brand-stamp">幕</div><p>資料の棚を開いています…</p></div>;
 
   return (
@@ -591,8 +601,8 @@ function App() {
           {scenario && page !== 'settings' && analysisState.id === scenario.id && <AnalysisStatus state={analysisState}/>}
           {(notice || error) && <div className={'toast ' + (error ? 'toast-error' : '')}><span>{error ? '!' : '✓'}</span><div>{error || notice}</div><button onClick={() => { setNotice(''); setError(''); }} aria-label="閉じる">×</button></div>}
           {!scenario && page !== 'settings' && <EmptyState onNew={() => setCreateOpen(true)} onDemo={createDemo} />}
-          {scenario && page === 'overview' && <Overview scenario={scenario} settings={settings} busy={busy} activeActions={activeActions} onEdit={() => setPage('evidence')} onPlans={() => setPage('plans')} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
-          {scenario && draft && page === 'evidence' && <EvidencePage scenario={scenario} title={draft.text.title} setTitle={(title) => editTextDraft({ title })} draft={draft.text.text} setDraft={(text) => editTextDraft({ text })} visibility={draft.text.visibility} setVisibility={(visibility) => editTextDraft({ visibility })} textSaving={draft.textSaving} profileSaving={draft.profileSaving} onAddText={addText} onAddFiles={addFiles} candidates={draft.candidates} onRemoveCandidate={removeCandidate} onPaste={handlePasteImage} editFor={(item) => scenarioDrafts.current.readEvidence(scenario, item)} onEvidenceEdit={editEvidenceDraft} onEvidenceSave={saveEvidence} onEvidenceEnabled={setEvidenceEnabled} onVisibility={setEvidenceVisibility} selected={selectedEvidence} onSelect={setSelectedEvidence} preview={preview} onPreview={previewImage} onSource={goToEvidence} onProfileSave={saveProfile} profile={draft.profile} setProfile={editProfileDraft} totalChars={usage.textCharacters} totalBytes={usage.attachmentBytes} retainedBytes={usage.retainedBytes} settings={settings} />}
+          {scenario && page === 'overview' && <Overview key={scenario.id} intake={intakeProps ? <EvidenceIntake {...intakeProps}/> : null} scenario={scenario} settings={settings} busy={busy} activeActions={activeActions} onEdit={() => setPage('evidence')} onPlans={() => setPage('plans')} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
+          {scenario && draft && intakeProps && page === 'evidence' && <EvidencePage {...intakeProps} textSaving={draft.textSaving} scenario={scenario} profileSaving={draft.profileSaving} editFor={(item) => scenarioDrafts.current.readEvidence(scenario, item)} onEvidenceEdit={editEvidenceDraft} onEvidenceSave={saveEvidence} onEvidenceEnabled={setEvidenceEnabled} onVisibility={setEvidenceVisibility} selected={selectedEvidence} onSelect={setSelectedEvidence} preview={preview} onPreview={previewImage} onSource={goToEvidence} onProfileSave={saveProfile} profile={draft.profile} setProfile={editProfileDraft}/>}
           {scenario && page === 'plans' && <PlansPage scenario={scenario} actions={activeActions} settings={settings} busy={busy} onAnalyze={() => runAnalysis()} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
           {scenario && page === 'history' && <HistoryPage scenario={scenario} history={historyActions} onRestore={restoreAction} onEvidence={goToEvidence} notesFor={notesFor} onNotesChange={editActionNotes} onNotesSave={saveActionNotes} pendingActionIds={pendingActionIds} />}
           {page === 'settings' && <div className="settings-scroll" role="region" aria-label="接続と保存の設定" tabIndex={0}><SettingsPage settings={settings} onSettings={receiveSettings} onSaved={receiveSettings} onCodexStatus={receiveCodexStatus} codexStatus={codexStatus} onDataFolder={() => window.makua.showDataFolder()} onError={reportError} onDelete={deleteScenario} scenario={scenario} /></div>}
@@ -659,8 +669,8 @@ function Citation({ scenario, id, page, verification, onEvidence, action }: { sc
 }
 
 function Citations({ scenario, ids, onEvidence, action }: { scenario: Scenario; ids: string[]; onEvidence: OpenSource; action?: Action }) {
-  if (!ids?.length) return null;
-  return <span className="citations">{ids.map((id) => <Citation key={id} scenario={scenario} id={id} onEvidence={onEvidence} action={action}/>)}</span>;
+  if (!Array.isArray(ids) || !ids.length) return null;
+  return <span className="citations">{[...new Set(ids.filter((id) => typeof id === 'string' && id.trim()))].map((id) => <Citation key={id} scenario={scenario} id={id} onEvidence={onEvidence} action={action}/>)}</span>;
 }
 
 function Assumptions({ values }: { values?: string[] }) {
@@ -677,50 +687,59 @@ function AnalysisChangeNotice({ scenario }: { scenario: Scenario }) {
     ? <p className="source-snapshot-note">変更は前回の解析へ未反映です。ここには前回の整理結果を表示しています。出典は保存当時の内容で開けます。</p> : null;
 }
 
-function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, onEvidence, onComplete, onDiscard, pendingActionIds = [] }: {
+function ExpandableList({ items, limit, label }: { items: ReactNode[]; limit: number; label: string }) {
+  const remaining = Math.max(0, items.length - limit);
+  return <>{items.slice(0, limit)}{remaining > 0 && <details className="list-more" data-list={label}>
+    <summary aria-label={label + 'の残り' + remaining + '件を表示'}>残り{remaining}件を表示 <span>＋</span></summary>
+    <div className="more-items">{items.slice(limit)}</div>
+  </details>}</>;
+}
+
+function Overview({ scenario, settings, activeActions, onEdit, onEvidence, onComplete, onDiscard, pendingActionIds = [], intake }: {
   scenario: Scenario; settings: AppSettings; busy: boolean; activeActions: Action[]; onEdit: () => void; onPlans: () => void;
-  onEvidence: (id: string) => void; onComplete: (action: Action) => void; onDiscard: (action: Action) => void; pendingActionIds?: string[];
+  onEvidence: OpenSource; onComplete: (action: Action) => void; onDiscard: (action: Action) => void; pendingActionIds?: string[]; intake?: ReactNode;
 }) {
   const analysis = scenario.analysis;
-  return <div className="page-stack">
+  return <div className="page-stack play-page">
     <AnalysisChangeNotice scenario={scenario}/>
-    <div className="page-intro"><div><div className="eyebrow">SESSION OVERVIEW</div><h1>いま見えていること</h1><p>事実・読み取り・未確認を分け、行動の根拠へ戻れる形で整理します。</p></div><div className="intro-metrics"><div><span>{scenario.evidence.length.toString().padStart(2, '0')}</span><small>資料</small></div><div><span>{activeActions.length.toString().padStart(2, '0')}</span><small>次の行動</small></div></div></div>
-    {!analysis && <div className="connect-note"><div className="connect-icon">✳</div><div><strong>AIは未接続です</strong><p>概要と証拠をこのPCに保存できます。資料に基づく状況整理と順位付き方針は、設定からAIを接続すると利用できます。未接続の状態では、こちらで内容を解析したようには表示しません。</p></div><button className="text-button" onClick={onEdit}>資料を追加 <span>→</span></button></div>}
-    {analysis && <div className="overview-grid">
-      <div className="overview-main">
-        <section className="panel situation-panel">
-          <div className="panel-top"><div><span className="panel-kicker"><span className="live-dot"/> CURRENT READ</span><h2>現在の流れ</h2></div><div className="panel-top-right"><span className="source-badge">{analysis.provider}</span><span className="tiny-date">{dateLabel(analysis.updatedAt)} 更新</span></div></div>
-          <p className="situation-text">{analysis.overview}</p>
-          <div className="situation-footer"><span>資料に基づく概括</span><button className="text-button" onClick={onPlans}>次の行動を見る <span>→</span></button></div>
+    <div className="page-intro"><div><div className="eyebrow">PLAY SESSION</div><h1>現在地と、次の行動</h1><p>情報を追加 → 整理結果を更新 → 次の行動を読む</p></div><div className="intro-metrics"><div><span>{scenario.evidence.length.toString().padStart(2, '0')}</span><small>資料</small></div><div><span>{activeActions.length.toString().padStart(2, '0')}</span><small>次の行動</small></div></div></div>
+    <nav className="play-jumps" aria-label="プレイ画面内の移動"><a href="#play-intake">＋ 情報を追加</a><a href="#play-actions">次の行動</a><a href="#play-results">整理結果を読む</a><button className="text-button" onClick={onEdit}>資料一覧・編集</button></nav>
+    <div className="play-grid">
+      <div className="play-primary">
+        <section className="panel situation-panel" aria-label="現在地">
+          <div className="panel-top"><div><span className="panel-kicker">CURRENT READ</span><h2>現在地</h2></div>{analysis && <div className="panel-top-right"><span className="source-badge">{analysis.provider}</span><span className="tiny-date">{dateLabel(analysis.updatedAt)} 更新</span></div>}</div>
+          <p className="situation-text">{analysis?.overview || 'HO・初期資料や会話のメモを、この画面から追加できます。保存後、設定に従って整理結果を更新します。'}</p>
+          {!analysis && settings.provider === 'none' && <p className="muted-copy">AI未接続でも資料を保存できます。接続と自動更新は設定から選べます。</p>}
+          {!!analysis?.flow?.length && <details className="flow-details"><summary>流れの詳細（{analysis.flow.length}件）</summary>{analysis.flow.map((item, index) => <div key={index}><strong>{item.moment}</strong><p>{item.summary}</p><Citations scenario={scenario} ids={item.evidenceIds} onEvidence={onEvidence}/></div>)}</details>}
         </section>
-        <section className="panel event-panel">
-          <div className="panel-top"><div><span className="panel-kicker">TIME / PEOPLE / EVENT</span><h2>時刻と出来事</h2></div><button className="text-button" onClick={onEdit}>原資料へ <span>→</span></button></div>
-          {analysis.events?.length ? <div className="event-list">{analysis.events.slice(0, 5).map((event, index) => <EventRow key={index} event={event} scenario={scenario} onEvidence={onEvidence}/>)}</div> : <p className="muted-copy">イベント記録はまだありません。AI接続後の更新で資料ID・ページ・原文引用とともに整理します。</p>}
-          {(analysis.events?.length || 0) > 5 && <button className="text-button event-more" onClick={onEdit}>すべてのイベントを見る <span>→</span></button>}
+        <section id="play-actions" className="play-actions" aria-label="次の行動">
+          <div className="play-section-heading"><h2>次の行動 <span>{activeActions.length}件</span></h2><p>優先順です。完了・見送りは必要なときだけ使えます。</p></div>
+          {activeActions.length ? <div className="action-list"><ExpandableList label="次の行動" limit={3} items={activeActions.map((action) => <ActionCard key={action.id} scenario={scenario} action={action} onEvidence={onEvidence} onComplete={onComplete} onDiscard={onDiscard} pending={pendingActionIds.includes(action.id)}/>)}/></div> : <div className="no-evidence no-actions"><strong>{analysis ? '現在有効な行動はありません' : '資料を追加すると、ここに行動案が並びます'}</strong><p>履歴は残したまま、新しい情報を追加して続けられます。HOの役・目的は解析で利用するため、別欄への再入力は不要です。</p></div>}
+        </section>
+      </div>
+      <aside className="play-intake" id="play-intake" aria-label="情報の追加">
+        {intake}
+        <details className="play-profile"><summary>シナリオ情報・役と目的の補足（任意）</summary>
+          <p>HOにある役・目的は解析で利用します。補足したい場合だけ別欄を使えます。</p>
+          {scenario.roleProfile?.role && <strong>{scenario.roleProfile.role}</strong>}{scenario.roleProfile?.goal && <p>{scenario.roleProfile.goal}</p>}
+          <p>{settings.includeRoleProfile ? '補足プロフィールの役・目的・秘密も次回解析に含めます。' : '補足プロフィールと役情報由来・由来不明の過去の整理結果は送信しません。HO内の役情報は資料の送信設定に従います。'}</p>
+          <button className="text-button" onClick={onEdit}>補足・資料一覧を開く →</button>
+        </details>
+      </aside>
+    </div>
+    <section id="play-results" className="play-results" aria-label="整理結果">
+      <div className="play-section-heading"><h2>整理結果を読む</h2><p>事実・仮説・未確認を分け、必要なときに出典から原本を開けます。</p></div>
+      {analysis ? <div className="play-results-grid">
+        <section className="panel event-panel"><div className="panel-top"><div><span className="panel-kicker">TIME / PEOPLE / EVENT</span><h2>時刻と出来事 <span className="result-count">{analysis.events?.length || 0}件</span></h2></div></div>
+          {analysis.events?.length ? <div className="event-list"><ExpandableList label="出来事" limit={5} items={analysis.events.map((event, index) => <EventRow key={index} event={event} scenario={scenario} onEvidence={onEvidence}/>)}/></div> : <p className="muted-copy">出来事の記録はまだありません。</p>}
         </section>
         <div className="signal-grid">
           <SignalPanel type="fact" label="資料にある事実" count={analysis.facts?.length || 0} items={analysis.facts || []} scenario={scenario} onEvidence={onEvidence}/>
           <SignalPanel type="hypothesis" label="仮説・読み取り" count={analysis.hypotheses?.length || 0} items={analysis.hypotheses || []} scenario={scenario} onEvidence={onEvidence}/>
           <SignalPanel type="unknown" label="まだ未確認" count={analysis.unknowns?.length || 0} items={analysis.unknowns || []} scenario={scenario} onEvidence={onEvidence}/>
         </div>
-      </div>
-      <aside className="overview-rail">
-        <section className="role-card">
-          <div className="role-card-head"><span className="eyebrow">YOUR ROLE / GOAL</span><button onClick={onEdit} aria-label="役と目的を編集">↗</button></div>
-          <div className="role-name">{scenario.roleProfile?.role || '役が未入力'}</div>
-          <p>{scenario.roleProfile?.goal || '役の目的が分かると、質問の順番をあなたの狙いに合わせられます。'}</p>
-          <div className="secret-row"><span>秘密</span><span>{scenario.roleProfile?.secret ? '登録済み' : '未登録'}</span><span className="secret-eye">◈</span></div>
-          <div className="role-scope-note">{settings.includeRoleProfile ? '次回の解析に役・目的・秘密を含める設定です。' : '役プロフィールと役情報由来・由来不明の過去の整理結果は送信しません。HO内の役情報は資料の送信設定に従います。'}</div>
-        </section>
-        <section className="quick-plans">
-          <div className="quick-plans-head"><div><span className="eyebrow">NEXT MOVES</span><h3>次に確かめること</h3></div><button onClick={onPlans}>すべて <span>→</span></button></div>
-          {activeActions.length ? activeActions.slice(0, 3).map((action) => <div key={action.id} className="mini-action" data-action-id={action.id}><div className="mini-number">{String(action.priority).padStart(2, '0')}</div><div><strong>{action.title}</strong><span>{action.who || '相手は未特定'}</span><Assumptions values={action.assumptions}/><ActionCare action={action}/><RecheckNotes action={action}/><small>{action.rationale}</small><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence} action={action}/><ActionControls action={action} onComplete={onComplete} onDiscard={onDiscard} pending={pendingActionIds.includes(action.id)}/></div></div>) : <p className="muted-copy">有効な行動はありません。新しい資料を追加して更新してください。</p>}
-          {activeActions.length > 0 && <button className="button button-green plan-open" onClick={onPlans}>行動の詳細を開く <span>↗</span></button>}
-        </section>
-        <section className="flow-footnote"><span className="footnote-mark">i</span><div><strong>情報の種類と公開範囲は別々</strong><p>事実・仮説・未確認は内容の確かさ。全体公開・自分だけ・不明は誰が知っているかの整理です。</p></div></section>
-      </aside>
-    </div>}
-    {!analysis && <ScenarioSetupForm scenario={scenario} onSave={async (next) => { await next(); }} />}
+      </div> : <p className="muted-copy">資料を保存し、状況を更新すると整理結果を読めます。</p>}
+    </section>
   </div>;
 }
 
@@ -737,14 +756,58 @@ function EventRow({ event, scenario, onEvidence }: { event: EventRecord; scenari
   </article>;
 }
 
-function SignalPanel({ type, label, count, items, scenario, onEvidence }: { type: 'fact' | 'hypothesis' | 'unknown'; label: string; count: number; items: { statement?: string; question?: string; why?: string; evidenceIds: string[]; assumptions?: string[] }[]; scenario: Scenario; onEvidence: (id: string) => void }) {
-  return <section className={'signal-panel signal-' + type}><div className="signal-head"><span className="signal-mark">{type === 'fact' ? '■' : type === 'hypothesis' ? '◧' : '○'}</span><span>{label}</span><span className="signal-count">{String(count).padStart(2, '0')}</span></div>
-    {items.length ? items.slice(0, 3).map((item, index) => <div key={index} className="signal-item"><p>{item.statement || item.question}</p>{type === 'hypothesis' && <Assumptions values={item.assumptions}/>} {item.why && <small>{item.why}</small>}<Citations scenario={scenario} ids={item.evidenceIds || []} onEvidence={onEvidence}/></div>) : <p className="signal-empty">{type === 'fact' ? '資料に明記された事実はまだありません。' : type === 'hypothesis' ? '仮説・読み取りはまだありません。' : '未確認の問いはありません。'}</p>}
-  </section>;
+function SignalPanel({ type, label, items, scenario, onEvidence, full = false }: { type: 'fact' | 'hypothesis' | 'unknown'; label: string; count: number; items: { statement?: string; question?: string; why?: string; evidenceIds: string[]; assumptions?: string[] }[]; scenario: Scenario; onEvidence: OpenSource; full?: boolean }) {
+  const facts = type === 'fact' ? partitionFacts(items, scenario) : null;
+  const visible = facts ? facts.confirmed : items;
+  const rows = visible.map((item, index) => <div key={index} className="signal-item" data-fact-status={type === 'fact' ? 'confirmed' : undefined}><p>{item.statement || ('question' in item ? item.question : '')}</p>{type === 'hypothesis' && <Assumptions values={'assumptions' in item ? item.assumptions : undefined}/>}
+    {'why' in item && item.why && <small>{item.why}</small>}<Citations scenario={scenario} ids={item.evidenceIds} onEvidence={onEvidence}/></div>);
+  return <><section className={'signal-panel signal-' + type} aria-label={label}>
+    <div className="signal-head"><span className="signal-mark">{type === 'fact' ? '■' : type === 'hypothesis' ? '◧' : '○'}</span><span>{label}</span><span className="signal-count">{String(visible.length).padStart(2, '0')}</span></div>
+    {rows.length ? <ExpandableList items={rows} limit={full ? rows.length : 3} label={label}/> : <p className="signal-empty">{type === 'fact' ? '出典を確認できる事実はまだありません。' : type === 'hypothesis' ? '仮説・読み取りはまだありません。' : '未確認の問いはありません。'}</p>}
+  </section>{!!facts?.unconfirmed.length && <section className="signal-panel unconfirmed-facts" aria-label="未確認の旧解析記述">
+    <div className="signal-head"><span>未確認の旧解析記述</span><span className="signal-count">{facts.unconfirmed.length}</span></div>
+    <p className="signal-empty">保存された出典を確認できないため、事実として扱っていません。元の記述は保持されています。</p>
+    <ExpandableList label="未確認の旧解析記述" limit={full ? facts.unconfirmed.length : 3} items={facts.unconfirmed.map((item, index) => <article className="signal-item" data-fact-status="unconfirmed" key={index}><strong className="legacy-fact-label">未確認</strong><p>{item.statement}</p><small>{item.reason}</small><Citations scenario={scenario} ids={item.evidenceIds} onEvidence={onEvidence}/></article>)}/>
+  </section>}</>;
 }
 
 function ScenarioSetupForm({ scenario, onSave }: { scenario: Scenario; onSave: (next: () => Promise<void>) => void }) {
   return <div className="setup-reminder"><div className="setup-reminder-icon">✎</div><div><strong>シナリオ概要とあなたの目的を記録できます</strong><p>HOに書かれた役・目的は解析で読み取ります。別欄への補足は任意です。原資料は「資料を追加」へ保存します。</p></div></div>;
+}
+
+type IntakeProps = {
+  title: string; setTitle: (value: string) => void; draft: string; setDraft: (value: string) => void;
+  visibility: Visibility; setVisibility: (value: Visibility) => void; textSaving?: boolean;
+  onAddText: (event: FormEvent) => void; onAddFiles: () => void;
+  candidates?: DraftCandidate[]; onRemoveCandidate?: (candidate: DraftCandidate) => void;
+  onPaste?: (event: ClipboardEvent<HTMLFormElement>) => void;
+  totalChars: number; totalBytes: number; retainedBytes?: number; settings: AppSettings;
+};
+
+function EvidenceIntake({ title, setTitle, draft, setDraft, visibility, setVisibility, textSaving = false, onAddText, onAddFiles, candidates = [], onRemoveCandidate, onPaste, totalChars, totalBytes, retainedBytes = totalBytes, settings }: IntakeProps) {
+  return (
+    <form className="panel add-note-panel" onSubmit={onAddText} onPaste={onPaste} onKeyDown={(event) => {
+          if (event.key !== 'Enter' || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+          if (event.ctrlKey || event.metaKey) { event.preventDefault(); event.currentTarget.requestSubmit(); }
+          else if (event.target instanceof HTMLInputElement) event.preventDefault();
+        }}>
+          <div className="panel-top"><div><span className="panel-kicker">ADD A CLUE</span><h2>情報を追加</h2></div><span className="step-pill">01</span></div>
+          <details className="intake-options"><summary>資料名・公開範囲 <span>必要なときだけ変更</span></summary>
+            <label className="field-label">見出し <span>空欄なら本文から補完</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例：食堂で聞いたこと"/></label>
+            <VisibilitySelect value={visibility} onChange={setVisibility}/>
+          </details>
+          <label className="field-label">本文 <span>原文のまま保存</span><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="会話、配布情報、気づいたことを貼り付けます。時刻や言い回しはそのまま残ります。" rows={5}/></label>
+          <button className="drop-zone" type="button" onClick={onAddFiles}><span className="upload-mark">↥</span><strong>ファイルを選択</strong><small>複数選択できます　·　PDF / PNG / JPG / WebP / TXT / MD</small></button>
+          <div className="paste-tip"><span>⌘</span><div><strong>この窓口に画像を貼り付け</strong><small>文章・ファイル・画像は、追加ボタンまたはCtrl+Enterでまとめて確定します。入力途中ではAIへ送りません。</small></div></div>
+          {!!candidates.length && <ul className="intake-candidates">{candidates.map((item, index) => <li key={item.id} data-candidate-id={item.id}>
+            {item.dataUrl && <img src={item.dataUrl} alt={'追加候補 ' + (index + 1)}/>}
+            <div><strong>{item.name}</strong><small>{bytesLabel(item.byteSize)}{item.loading ? '・読込中' : ''}</small>{item.error && <span role="alert">{item.error}</span>}</div>
+            <button type="button" disabled={textSaving} onClick={() => onRemoveCandidate?.(item)} aria-label={item.name + 'を候補から外す'}>×</button>
+          </li>)}</ul>}
+          <button className="button button-ink full-button" type="submit" disabled={textSaving || (!draft.trim() && !candidates.length) || candidates.some((item) => item.loading || item.error)}>{textSaving ? '保存中…' : '資料に追加'} <span>→</span></button>
+          <div className="retention-meter"><div className="meter-copy"><span>解析対象の添付</span><strong>{bytesLabel(totalBytes)} <small>/ 40MiB</small></strong></div><div className="meter-track"><span style={{ width: Math.min(100, totalBytes / (40 * 1024 * 1024) * 100) + '%' }}/></div><p>保存済み原本 {bytesLabel(retainedBytes)}。解析本文 {totalChars.toLocaleString()} / {settings.textLimitCharacters.toLocaleString()}文字。1ファイル20MiBまで取り込めます。上限を超えたら、資料一覧で編集するか解析対象から外して再開できます。</p></div>
+        </form>
+  );
 }
 
 function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, setVisibility, textSaving, profileSaving, onAddText, onAddFiles, onVisibility, selected, onSelect, preview, onPreview, onSource, onProfileSave, profile, setProfile, totalChars, totalBytes, retainedBytes = totalBytes, settings, candidates = [], onRemoveCandidate, onPaste, editFor, onEvidenceEdit, onEvidenceSave, onEvidenceEnabled }: {
@@ -761,27 +824,7 @@ function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, 
     <div className="page-intro"><div><div className="eyebrow">THE SOURCE SHELF</div><h1>資料を、原文のまま。</h1><p>文章を貼り付けるか、PDF・画像・テキストファイルをまとめて追加できます。</p></div><div className="intro-metrics"><div><span>{scenario.evidence.length.toString().padStart(2, '0')}</span><small>資料</small></div><div><span>{totalChars.toLocaleString()}</span><small>文字</small></div></div></div>
     <div className="evidence-layout">
       <div className="evidence-input-column">
-        <form className="panel add-note-panel" onSubmit={onAddText} onPaste={onPaste} onKeyDown={(event) => {
-          if (event.key !== 'Enter' || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
-          if (event.ctrlKey || event.metaKey) { event.preventDefault(); event.currentTarget.requestSubmit(); }
-          else if (event.target instanceof HTMLInputElement) event.preventDefault();
-        }}>
-          <div className="panel-top"><div><span className="panel-kicker">ADD A CLUE</span><h2>情報を追加</h2></div><span className="step-pill">01</span></div>
-          <details className="intake-options"><summary>資料名・公開範囲 <span>必要なときだけ変更</span></summary>
-            <label className="field-label">見出し <span>空欄なら本文から補完</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例：食堂で聞いたこと"/></label>
-            <VisibilitySelect value={visibility} onChange={setVisibility}/>
-          </details>
-          <label className="field-label">本文 <span>原文のまま保存</span><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="会話、配布情報、気づいたことを貼り付けます。時刻や言い回しはそのまま残ります。" rows={8}/></label>
-          <button className="drop-zone" type="button" onClick={onAddFiles}><span className="upload-mark">↥</span><strong>ファイルを選択</strong><small>複数選択できます　·　PDF / PNG / JPG / WebP / TXT / MD</small></button>
-          <div className="paste-tip"><span>⌘</span><div><strong>この窓口に画像を貼り付け</strong><small>文章・ファイル・画像は、追加ボタンまたはCtrl+Enterでまとめて確定します。入力途中ではAIへ送りません。</small></div></div>
-          {!!candidates.length && <ul className="intake-candidates">{candidates.map((item, index) => <li key={item.id} data-candidate-id={item.id}>
-            {item.dataUrl && <img src={item.dataUrl} alt={'追加候補 ' + (index + 1)}/>}
-            <div><strong>{item.name}</strong><small>{bytesLabel(item.byteSize)}{item.loading ? '・読込中' : ''}</small>{item.error && <span role="alert">{item.error}</span>}</div>
-            <button type="button" disabled={textSaving} onClick={() => onRemoveCandidate?.(item)} aria-label={item.name + 'を候補から外す'}>×</button>
-          </li>)}</ul>}
-          <button className="button button-ink full-button" type="submit" disabled={textSaving || (!draft.trim() && !candidates.length) || candidates.some((item) => item.loading || item.error)}>{textSaving ? '保存中…' : '資料に追加'} <span>→</span></button>
-          <div className="retention-meter"><div className="meter-copy"><span>解析対象の添付</span><strong>{bytesLabel(totalBytes)} <small>/ 40MiB</small></strong></div><div className="meter-track"><span style={{ width: Math.min(100, totalBytes / (40 * 1024 * 1024) * 100) + '%' }}/></div><p>保存済み原本 {bytesLabel(retainedBytes)}。解析本文 {totalChars.toLocaleString()} / {settings.textLimitCharacters.toLocaleString()}文字。1ファイル20MiBまで取り込めます。上限を超えたら、資料一覧で編集するか解析対象から外して再開できます。</p></div>
-        </form>
+        <EvidenceIntake title={title} setTitle={setTitle} draft={draft} setDraft={setDraft} visibility={visibility} setVisibility={setVisibility} textSaving={textSaving} onAddText={onAddText} onAddFiles={onAddFiles} candidates={candidates} onRemoveCandidate={onRemoveCandidate} onPaste={onPaste} totalChars={totalChars} totalBytes={totalBytes} retainedBytes={retainedBytes} settings={settings}/>
         <form className="panel profile-panel" onSubmit={onProfileSave}>
           <div className="panel-top"><div><span className="panel-kicker">MY CHARACTER</span><h2>自分の役と目的</h2></div><span className="lock-icon">◈</span></div>
           <p className="panel-subcopy">HOの役・目的は解析で読み取るため、ここへの再入力は不要です。補足したいことがあれば任意で保存できます。</p>
@@ -869,6 +912,25 @@ function ActionSourceScope({ scenario, action }: { scenario: Scenario; action: A
   return <div className="action-source-scope"><span>根拠資料の公開範囲</span>{action.evidenceIds?.length ? <ScopeBadge visibility={getActionVisibility(scenario, action)}/> : <span className="scope-badge scope-unknown">参照資料なし</span>}</div>;
 }
 
+function ActionCard({ scenario, action, onEvidence, onComplete, onDiscard, pending = false }: {
+  scenario: Scenario; action: Action; onEvidence: OpenSource; onComplete: (action: Action) => void; onDiscard: (action: Action) => void; pending?: boolean;
+}) {
+  return <article className="action-card" data-action-id={action.id}>
+      <div className="action-rank"><span>優先</span><strong>{String(action.priority).padStart(2, '0')}</strong></div>
+      <div className="action-body"><div className="action-heading"><div><span className="action-kicker">NEXT ACTION</span><h2>{action.title}</h2></div><ActionSourceScope scenario={scenario} action={action}/></div>
+        <div className="action-one-line"><span>相手</span><strong>{action.who || '相手は資料から特定できていない'}</strong><span>手順</span><span className="action-step">{action.step}</span></div>
+        <Assumptions values={action.assumptions}/>
+        {action.suggestedLine && <p className="action-suggested-line">発言例: {action.suggestedLine}</p>}
+        <ActionCare action={action}/><RecheckNotes action={action}/>
+        <details className="action-details"><summary>理由・目的・出典の詳細 <span>詳細を開く　＋</span></summary>
+          <div className="action-detail-grid"><div className="detail-cell"><span>優先する理由</span><p>{action.rationale}</p></div><div className="detail-cell"><span>目的への寄与</span><p>{action.purpose || '目的とのつながりは未確認です。'}</p></div></div>
+          {!!action.evidenceIds?.length && <div className="action-source-line"><span>参照資料</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence} action={action}/></div>}
+        </details>
+        <ActionControls action={action} onComplete={onComplete} onDiscard={onDiscard} pending={pending}/>
+      </div>
+    </article>;
+}
+
 function PlansPage({ scenario, actions, settings, busy, onAnalyze, onEvidence, onComplete, onDiscard, pendingActionIds = [] }: {
   scenario: Scenario; actions: Action[]; settings: AppSettings; busy: boolean; onAnalyze: () => void; onEvidence: (id: string) => void; onComplete: (action: Action) => void; onDiscard: (action: Action) => void; pendingActionIds?: string[];
 }) {
@@ -877,20 +939,7 @@ function PlansPage({ scenario, actions, settings, busy, onAnalyze, onEvidence, o
     <div className="page-intro"><div><div className="eyebrow">ACTIONS TO TAKE</div><h1>次に確かめること</h1><p>数字は優先順です。犯人らしさの確率ではありません。</p></div><div className="intro-metrics"><div><span>{actions.length.toString().padStart(2, '0')}</span><small>有効な方針</small></div></div></div>
     <div className="plans-context"><div className="plan-context-icon">↗</div><div><span className="eyebrow">WHY THIS ORDER</span><strong>{scenario.roleProfile?.goal || 'HOに役・目的があれば解析で利用します。補足の入力は任意です。'}</strong><p>誰に何を聞くか、秘密への配慮を先に確認できます。目的や出典は詳細から読めます。</p></div><button className="button button-light" onClick={onAnalyze} disabled={busy}>{busy ? '更新中…' : 'もう一度解析'}</button></div>
     {scenario.analysis && <div className="strategy-summary"><span>現在地</span><p>{scenario.analysis.overview}</p><div><span>解析モデル: {scenario.analysis.provider}</span><span>更新 {dateLabel(scenario.analysis.updatedAt)}</span>{scenario.analysis.usage?.input_tokens != null && <span>入力 {scenario.analysis.usage.input_tokens.toLocaleString()} / 出力 {(scenario.analysis.usage.output_tokens || 0).toLocaleString()} tokens</span>}</div></div>}
-    {actions.length ? <div className="action-list">{actions.map((action) => <article className="action-card" key={action.id} data-action-id={action.id}>
-      <div className="action-rank"><span>優先</span><strong>{String(action.priority).padStart(2, '0')}</strong></div>
-      <div className="action-body"><div className="action-heading"><div><span className="action-kicker">NEXT ACTION</span><h2>{action.title}</h2></div><ActionSourceScope scenario={scenario} action={action}/></div>
-        <div className="action-one-line"><span>誰へ</span><strong>{action.who || '相手は資料から特定できていない'}</strong><span className="action-step">{action.step}</span></div>
-        <Assumptions values={action.assumptions}/>
-        {action.suggestedLine && <p className="action-suggested-line">発言例: {action.suggestedLine}</p>}
-        <ActionCare action={action}/><RecheckNotes action={action}/>
-        <details className="action-details"><summary>理由・目的・出典の詳細 <span>詳細を開く　＋</span></summary>
-          <div className="action-detail-grid"><div className="detail-cell"><span>優先する理由</span><p>{action.rationale}</p></div><div className="detail-cell"><span>目的への寄与</span><p>{action.purpose || '目的とのつながりは未確認です。'}</p></div></div>
-          {!!action.evidenceIds?.length && <div className="action-source-line"><span>参照資料</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence} action={action}/></div>}
-        </details>
-        <ActionControls action={action} onComplete={onComplete} onDiscard={onDiscard} pending={pendingActionIds.includes(action.id)}/>
-      </div>
-    </article>)}</div> : <div className="no-evidence no-actions"><div className="no-evidence-mark">↗</div><strong>{scenario.analysis ? '現在有効な方針はありません' : '資料から優先行動を作ります'}</strong><p>{scenario.analysis ? '過去の方針は履歴に残っています。新しい資料で状況を更新できます。' : 'AI未接続なら設定から接続するか、資料を先に登録してください。'}</p><button className="button button-ink" onClick={onAnalyze} disabled={busy}>{busy ? '解析中…' : '状況を解析する'}</button></div>}
+    {actions.length ? <div className="action-list">{actions.map((action) => <ActionCard key={action.id} scenario={scenario} action={action} onEvidence={onEvidence} onComplete={onComplete} onDiscard={onDiscard} pending={pendingActionIds.includes(action.id)}/>)}</div> : <div className="no-evidence no-actions"><div className="no-evidence-mark">↗</div><strong>{scenario.analysis ? '現在有効な方針はありません' : '資料から優先行動を作ります'}</strong><p>{scenario.analysis ? '過去の方針は履歴に残っています。新しい資料で状況を更新できます。' : 'AI未接続なら設定から接続するか、資料を先に登録してください。'}</p><button className="button button-ink" onClick={onAnalyze} disabled={busy}>{busy ? '解析中…' : '状況を解析する'}</button></div>}
     {settings.provider === 'none' && <div className="plain-mode-note"><span>i</span>AI未接続のとき、アプリは行動を自動生成しません。方針はAI接続後に資料から提案されます。</div>}
   </div>;
 }
@@ -911,7 +960,7 @@ function HistoryNoteEditor({ action, notes, onChange, onSave, pending = false }:
 }
 
 function HistoryPage({ scenario, history, onRestore, onEvidence, notesFor, onNotesChange, onNotesSave, pendingActionIds = [] }: {
-  scenario: Scenario; history: Action[]; onRestore: (action: Action) => void; onEvidence: (id: string) => void;
+  scenario: Scenario; history: Action[]; onRestore: (action: Action) => void; onEvidence: OpenSource;
   notesFor?: (action: Action) => ActionNotes; onNotesChange?: (action: Action, notes: ActionNotes) => void; onNotesSave?: (action: Action, notes: ActionNotes) => void; pendingActionIds?: string[];
 }) {
   const label = (status: string) => status === 'discarded' ? '見送り' : status === 'completed' ? '完了' : status === 'restored' ? '履歴から復帰' : '更新で置き換え';
@@ -924,17 +973,21 @@ function HistoryPage({ scenario, history, onRestore, onEvidence, notesFor, onNot
       </div>
       {action.status === 'discarded' && <button className="button button-light restore-button" onClick={() => onRestore(action)} disabled={pendingActionIds.includes(action.id)}>明示的に復帰</button>}
     </article>)}</div> : <div className="no-evidence"><div className="no-evidence-mark">↶</div><strong>まだ履歴はありません</strong><p>行動を完了・見送り・置き換えにしたとき、ここに内容と日時が残ります。</p></div>}
-    {(scenario.analysisHistory || []).slice().reverse().map((analysis, index) => <details className="panel previous-analysis" key={analysis.revision + '-' + index}>
+    {(scenario.analysisHistory || []).slice().reverse().map((analysis, index) => {
+      const analysisIndex = (scenario.analysisHistory?.length || 0) - 1 - index;
+      const openSaved: OpenSource = (id, page, verification) => onEvidence(id, page, verification, analysisIndex);
+      const saved = { ...scenario, analysis };
+      return <details className="panel previous-analysis" key={analysis.revision + '-' + index}>
       <summary>保存した以前の整理結果 · {dateLabel(analysis.updatedAt)}</summary>
       <p className="muted-copy">変更前の内容をこのPCで閲覧できます。資料の除外設定を反映し、役情報由来・由来不明の文章は役情報OFFの解析には送信しません。</p>
       <p>{analysis.overview}</p>
       {(analysis.flow || []).map((item, itemIndex) => <p key={'flow-' + itemIndex}>{item.moment} · {item.summary}</p>)}
-      {(analysis.events || []).map((event, eventIndex) => <EventRow key={'event-' + eventIndex} event={event} scenario={{ ...scenario, analysis }} onEvidence={onEvidence}/>)}
-      <h4>資料にある事実</h4>{(analysis.facts || []).map((item, itemIndex) => <p key={'fact-' + itemIndex}>{item.statement} <Citations scenario={{ ...scenario, analysis }} ids={item.evidenceIds} onEvidence={onEvidence}/></p>)}
-      <h4>仮説・読み取り</h4>{(analysis.hypotheses || []).map((item, itemIndex) => <div key={'hypothesis-' + itemIndex}><p>{item.statement}</p><p>{item.why}</p><Assumptions values={item.assumptions}/><Citations scenario={{ ...scenario, analysis }} ids={item.evidenceIds} onEvidence={onEvidence}/></div>)}
-      <h4>まだ未確認</h4>{(analysis.unknowns || []).map((item, itemIndex) => <p key={'unknown-' + itemIndex}>{item.question} · {item.why} <Citations scenario={{ ...scenario, analysis }} ids={item.evidenceIds} onEvidence={onEvidence}/></p>)}
-      <h4>その時の方針</h4>{(analysis.actions || []).map((action, actionIndex) => <details key={action.id + '-' + actionIndex}><summary>{action.title} · {action.who || '対象未特定'}</summary><p>{action.step}</p><p>{action.suggestedLine}</p><p>{action.purpose}</p><p>{action.rationale}</p><p>{action.secretRisk}</p><Assumptions values={action.assumptions}/><Citations scenario={{ ...scenario, analysis }} ids={action.evidenceIds} onEvidence={onEvidence}/></details>)}
-    </details>)}
+      {(analysis.events || []).map((event, eventIndex) => <EventRow key={'event-' + eventIndex} event={event} scenario={saved} onEvidence={openSaved}/>)}
+      <SignalPanel type="fact" label="資料にある事実" count={analysis.facts?.length || 0} items={analysis.facts || []} scenario={saved} onEvidence={openSaved} full/>
+      <h4>仮説・読み取り</h4>{(analysis.hypotheses || []).map((item, itemIndex) => <div key={'hypothesis-' + itemIndex}><p>{item.statement}</p><p>{item.why}</p><Assumptions values={item.assumptions}/><Citations scenario={saved} ids={item.evidenceIds} onEvidence={openSaved}/></div>)}
+      <h4>まだ未確認</h4>{(analysis.unknowns || []).map((item, itemIndex) => <p key={'unknown-' + itemIndex}>{item.question} · {item.why} <Citations scenario={saved} ids={item.evidenceIds} onEvidence={openSaved}/></p>)}
+      <h4>その時の方針</h4>{(analysis.actions || []).map((action, actionIndex) => <details key={action.id + '-' + actionIndex}><summary>{action.title} · {action.who || '対象未特定'}</summary><p>{action.step}</p><p>{action.suggestedLine}</p><p>{action.purpose}</p><p>{action.rationale}</p><p>{action.secretRisk}</p><Assumptions values={action.assumptions}/><Citations scenario={saved} ids={action.evidenceIds} onEvidence={openSaved}/></details>)}
+    </details>; })}
   </div>;
 }
 
