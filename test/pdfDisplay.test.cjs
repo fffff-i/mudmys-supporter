@@ -104,3 +104,17 @@ test('the actual App opens and closes source viewing while staying on the same o
   assert.equal(findElement(closed, (node) => node.type?.name === 'SourcePanel'), null);
   assert.ok(findElement(closed, (node) => node.type?.name === 'Overview'));
 });
+
+test('a historical fixed-source citation selects its own snapshot even when the fixed ID is reused', async () => {
+  const display = await loadDisplay();
+  const snapshots = ['older profile', 'newer profile'].map((text, revision) => ({ revision, sources: [{ id: 'scenario:role-profile', title: '役プロフィール', kind: 'text', extractedText: text }] }));
+  const scenario = { evidence: [], analysis: snapshots[0], analysisHistory: snapshots };
+  const calls = [];
+  const citation = display.Citation({ scenario, id: 'scenario:role-profile', onEvidence: (...args) => calls.push(args) });
+  citation.props.onClick();
+  assert.equal(calls[0][0], 'scenario:role-profile');
+  assert.equal(calls[0][3], 0);
+  const newer = display.Citation({ scenario: { ...scenario, analysis: snapshots[1] }, id: 'scenario:role-profile', onEvidence: (...args) => calls.push(args) });
+  newer.props.onClick();
+  assert.equal(calls[1][3], 1);
+});

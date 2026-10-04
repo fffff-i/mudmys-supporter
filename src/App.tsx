@@ -5,7 +5,7 @@ import { createSourceReader, type SourceViewState } from '../shared/sourceReader
 import type { Action, AppSettings, CodexConnectionStatus, EventRecord, Evidence, Scenario, Visibility } from './types';
 
 type Page = 'overview' | 'evidence' | 'plans' | 'history' | 'settings';
-type OpenSource = (id: string, page?: string, verification?: string) => void;
+type OpenSource = (id: string, page?: string, verification?: string, analysisIndex?: number) => void;
 const PAGES: { id: Page; label: string; mark: string }[] = [
   { id: 'overview', label: '現在地', mark: '○' },
   { id: 'evidence', label: '資料を追加', mark: '＋' },
@@ -41,6 +41,13 @@ function typeLabel(type: string) {
 function savedAnalysisSources(scenario: Scenario) {
   const sources = [...(scenario.analysis?.sources || []), ...(scenario.analysisHistory || []).slice().reverse().flatMap((analysis) => analysis.sources || [])];
   return sources.filter((source, index) => sources.findIndex((item) => item.id === source.id && item.extractedText === source.extractedText) === index);
+}
+
+function sourceHistoryIndex(scenario: Scenario, id: string) {
+  const source = savedAnalysisSources(scenario).find((item) => item.id === id);
+  if (!source) return undefined;
+  const index = (scenario.analysisHistory || []).findIndex((analysis) => analysis.sources?.includes(source));
+  return index < 0 ? undefined : index;
 }
 
 function sourceName(scenario: Scenario, id: string) {
@@ -452,9 +459,9 @@ function App() {
     } catch (reason) { reportError(reason, token); }
   };
 
-  const goToEvidence: OpenSource = (id, sourcePage, verification) => {
+  const goToEvidence: OpenSource = (id, sourcePage, verification, analysisIndex) => {
     if (!scenario) return;
-    void sourceReader.current.open({ id: scenario.id, evidenceId: id, page: sourcePage }, verification);
+    void sourceReader.current.open({ id: scenario.id, evidenceId: id, page: sourcePage, analysisIndex }, verification);
   };
 
   if (loading) return <div className="loading-screen"><div className="brand-stamp">幕</div><p>資料の棚を開いています…</p></div>;
@@ -506,7 +513,7 @@ function App() {
           {scenario && page === 'plans' && <PlansPage scenario={scenario} actions={activeActions} settings={settings} busy={busy || autoBusy} onAnalyze={() => runAnalysis()} onEvidence={goToEvidence} onComplete={completeAction} onDiscardStart={(action) => { setDiscardId(action.id); setDiscardReason(''); }} discardId={discardId} discardReason={discardReason} setDiscardReason={setDiscardReason} onDiscard={discardAction} onDiscardCancel={() => { setDiscardId(''); setDiscardReason(''); }} />}
           {scenario && page === 'history' && <HistoryPage scenario={scenario} history={historyActions} onRestore={restoreAction} onEvidence={goToEvidence} />}
           {page === 'settings' && <div className="settings-scroll" role="region" aria-label="接続と保存の設定" tabIndex={0}><SettingsPage settings={settings} onSettings={setSettings} onSaved={setSettings} onCodexStatus={receiveCodexStatus} codexStatus={codexStatus} onDataFolder={() => window.makua.showDataFolder()} onError={reportError} onDelete={deleteScenario} scenario={scenario} /></div>}
-          {scenario && sourceView && <SourcePanel view={sourceView} title={sourceName(scenario, sourceView.request.evidenceId)} onClose={() => sourceReader.current.close()} onPage={(number) => goToEvidence(sourceView.request.evidenceId, String(number))}/>}
+          {scenario && sourceView && <SourcePanel view={sourceView} title={sourceName(scenario, sourceView.request.evidenceId)} onClose={() => sourceReader.current.close()} onPage={(number) => goToEvidence(sourceView.request.evidenceId, String(number), undefined, sourceView.request.analysisIndex)}/>}
         </main>
         {scenario && page !== 'settings' && <footer className="session-footer"><span>自動保存</span><span className="footer-dot">·</span><span>{scenario.evidence.length} 件の資料</span><span className="footer-dot">·</span><span>更新 {dateLabel(scenario.updatedAt)}</span>{settings.autoUpdate && <span className="footer-auto">自動更新 ON</span>}<button onClick={exportScenario}>バックアップを書き出す</button><button className="footer-delete" onClick={deleteScenario}>シナリオを削除</button></footer>}
       </div>
@@ -551,7 +558,8 @@ function SectionHeading({ overline, title, note }: { overline: string; title: st
 function Citation({ scenario, id, page, verification, onEvidence }: { scenario: Scenario; id: string; page?: string; verification?: string; onEvidence: OpenSource }) {
   const index = scenario.evidence.findIndex((item) => item.id === id);
   const source = savedAnalysisSources(scenario).find((item) => item.id === id);
-  if (source) return <button className="citation-chip" onClick={() => onEvidence(id, page, verification)} title="解析に使った内容を開く">{source.title}　↗</button>;
+  const analysisIndex = sourceHistoryIndex(scenario, id);
+  if (source) return <button className="citation-chip" onClick={() => analysisIndex === undefined ? onEvidence(id, page, verification) : onEvidence(id, page, verification, analysisIndex)} title="解析に使った内容を開く">{source.title}　↗</button>;
   if (index < 0) return <span className="citation-missing">資料なし</span>;
   return <button className="citation-chip" onClick={() => onEvidence(id, page, verification)} title="同じ画面で原本を開く">証拠 {String(index + 1).padStart(2, '0')}{page ? '　p.' + page : ''}　↗</button>;
 }
@@ -619,12 +627,13 @@ function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, on
 
 function EventRow({ event, scenario, onEvidence }: { event: EventRecord; scenario: Scenario; onEvidence: OpenSource }) {
   const verification = event.quoteVerification || (/画像/.test(event.quoteOrigin || '') ? 'image_unverified' : 'legacy_text_matched');
+  const analysisIndex = sourceHistoryIndex(scenario, event.sourceId);
   return <article className="event-row">
     <div className="event-time">{event.timeText || '時刻不明'}</div>
     <div className="event-main"><div className="event-line"><span className="event-type">{typeLabel(event.type)}</span><span className="event-people">{event.people?.length ? event.people.join(' ／ ') : '人物不明'}</span></div><p>{event.what}</p>
       {event.quote && <blockquote>{event.quote}<small>{quoteVerificationLabel(verification)}</small></blockquote>}
       {event.ambiguity && <div className="ambiguity-note"><span>?</span><span>要確認の曖昧さ</span> {event.ambiguity}</div>}
-      <div className="event-cite"><Citation scenario={scenario} id={event.sourceId} page={event.page} verification={verification} onEvidence={onEvidence}/><button className="text-button source-open" onClick={() => onEvidence(event.sourceId, event.page, verification)}>原本を開く ↗</button></div>
+      <div className="event-cite"><Citation scenario={scenario} id={event.sourceId} page={event.page} verification={verification} onEvidence={onEvidence}/><button className="text-button source-open" onClick={() => onEvidence(event.sourceId, event.page, verification, analysisIndex)}>原本を開く ↗</button></div>
     </div>
   </article>;
 }

@@ -823,8 +823,14 @@ ipcMain.handle('scenario:preview-image', async (_event, payload) => {
 });
 ipcMain.handle('scenario:read-source', async (_event, payload) => {
   const record = await readCase(payload.id);
-  const item = record.evidence.find((entry) => entry.id === payload.evidenceId) ||
-    record.analysis?.sources?.find((entry) => entry.id === payload.evidenceId);
+  const history = record.analysisHistory || [];
+  if (payload.analysisIndex !== undefined && !(Number.isInteger(payload.analysisIndex) && payload.analysisIndex >= 0 && payload.analysisIndex < history.length)) {
+    throw new Error('保存された解析を確認できません。');
+  }
+  const analysis = payload.analysisIndex === undefined ? record.analysis : history[payload.analysisIndex];
+  const fallbackSources = payload.analysisIndex === undefined ? history.slice().reverse().flatMap((entry) => entry.sources || []) : [];
+  const item = (record.evidence || []).find((entry) => entry.id !== SYNOPSIS_SOURCE_ID && entry.id !== ROLE_PROFILE_SOURCE_ID && entry.id === payload.evidenceId) ||
+    analysis?.sources?.find((entry) => entry.id === payload.evidenceId) || fallbackSources.find((entry) => entry.id === payload.evidenceId);
   if (!item) throw new Error('資料が見つかりません。');
   const base = { title: item.title, kind: item.kind, text: item.extractedText || '', dataUrl: '', pageNumber: null, pageCount: null, pdfPages: [], extractionMessage: item.extractionMessage || '' };
   if (item.kind === 'text') return base;

@@ -1,6 +1,6 @@
 import type { SourcePreview } from '../src/types';
 
-export type SourceRequest = { id: string; evidenceId: string; page?: string };
+export type SourceRequest = { id: string; evidenceId: string; page?: string; analysisIndex?: number };
 export type SourceViewState = {
   request: SourceRequest;
   verification?: string;

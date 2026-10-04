@@ -181,3 +181,33 @@ test('standalone image originals are sent and viewable, while text and fixed sou
   assert.equal((await harness.invoke('scenario:read-source', { id: scenario.id, evidenceId: item.id })).text, '一字一句そのまま');
   assert.equal((await harness.invoke('scenario:read-source', { id: scenario.id, evidenceId: 'scenario:synopsis' })).text, '以前の概要');
 });
+
+for (const provider of ['openai', 'ollama', 'codex']) {
+  test(provider + ' preserves protected local snapshots while PDF input excludes their text with role OFF', async (t) => {
+    const harness = await loadMockMain(t);
+    const scenario = scenarioFixture();
+    const item = scenario.evidence[0];
+    const grounding = { version: 1, includeRoleProfile: true, previousContextMayIncludeRoleProfile: false, evidenceIds: [item.id, 'scenario:role-profile'] };
+    const snapshot = (revision, secret) => ({ revision, overview: secret, actions: [], hypotheses: [], grounding,
+      sources: [{ id: 'scenario:role-profile', kind: 'text', title: 'その時の役プロフィール', extractedText: secret, visibility: 'private' }] });
+    scenario.roleProfile = { secret: 'CURRENT_PROFILE_PRIVATE' };
+    scenario.analysisHistory = [snapshot(0, 'EARLIER_PROFILE_PRIVATE')];
+    scenario.analysis = snapshot(1, 'PRIOR_ANALYSIS_PRIVATE');
+    scenario.analysis.actions = [{ id: 'protected-action', title: 'PROTECTED_ACTION_PRIVATE', step: 'PROTECTED_ACTION_PRIVATE', status: 'active', grounding }];
+    await harness.store(scenario, provider);
+    await harness.attachment(scenario, 'synthetic.pdf', pdfFixture());
+    harness.setOutput(resultFor(item, 1, '08:10 returned key'));
+    const result = await harness.analyzeCase(scenario.id, 1);
+    assert.equal(result.status, 'ok', result.message);
+    const requestText = JSON.stringify(harness.requests.at(-1).request);
+    assert.doesNotMatch(requestText, /CURRENT_PROFILE_PRIVATE|EARLIER_PROFILE_PRIVATE|PRIOR_ANALYSIS_PRIVATE|PROTECTED_ACTION_PRIVATE/);
+    assert.equal(result.scenario.analysisHistory.length, 2);
+    assert.equal(result.scenario.analysis.grounding.previousContextMayIncludeRoleProfile, false);
+    assert.equal(result.scenario.actionHistory[0].id, 'protected-action');
+    const query = { id: scenario.id, evidenceId: 'scenario:role-profile' };
+    assert.equal((await harness.invoke('scenario:read-source', { ...query, analysisIndex: 0 })).text, 'EARLIER_PROFILE_PRIVATE');
+    assert.equal((await harness.invoke('scenario:read-source', { ...query, analysisIndex: 1 })).text, 'PRIOR_ANALYSIS_PRIVATE');
+    assert.equal((await harness.invoke('scenario:read-source', query)).text, 'PRIOR_ANALYSIS_PRIVATE');
+    for (const analysisIndex of [-1, 2, '0', null]) await assert.rejects(harness.invoke('scenario:read-source', { ...query, analysisIndex }), /保存された解析/);
+  });
+}

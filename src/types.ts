@@ -193,7 +193,7 @@ declare global {
       addPastedImage: (value: Record<string, unknown>) => Promise<Scenario>;
       setVisibility: (value: Record<string, unknown>) => Promise<Scenario>;
       previewImage: (value: Record<string, unknown>) => Promise<string>;
-      readSource: (value: { id: string; evidenceId: string; page?: string }) => Promise<SourcePreview>;
+      readSource: (value: { id: string; evidenceId: string; page?: string; analysisIndex?: number }) => Promise<SourcePreview>;
       completeAction: (value: Record<string, unknown>) => Promise<Scenario>;
       discardAction: (value: Record<string, unknown>) => Promise<Scenario>;
       restoreAction: (value: Record<string, unknown>) => Promise<Scenario>;
