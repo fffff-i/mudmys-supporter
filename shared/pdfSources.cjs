@@ -20,6 +20,7 @@ function pdfTextForInput(item, visualInput) {
   const header = visualInput
     ? '[PDF原本のページ画像も入力に含まれます。本文と画像が同じページに混在する場合もあります。]'
     : '[PDFページ画像は送信していません。抽出本文だけを使い、画像部分を読めたものとして引用しないでください。]';
+  if (typeof item.editedText === 'string') return header + '\n' + editedTextForInput(item);
   if (!hasPdfMetadata(item)) return header + '\n' + (item.extractedText || '[ページ別の抽出情報なし]');
   if (!item.pdfPageCount) return header + '\n[PDFを読み取れず、ページ数は不明です。]';
   return header + '\n[原本の総ページ数: ' + item.pdfPageCount + ']\n' + item.pdfPages.map((page) => {
@@ -30,11 +31,23 @@ function pdfTextForInput(item, visualInput) {
   }).join('\n\n');
 }
 
+function editedTextForInput(item) {
+  return '[利用者が編集した本文。原本の抽出本文とは別です。この本文の引用はquoteSourceをeditedにし、原本ページとの照合済みとは扱わない。]\n' + (item.editedText || '[編集した本文は空です]');
+}
+
+function evidenceTextForInput(item, visualInput = true) {
+  if (item.kind === 'pdf') return pdfTextForInput(item, visualInput);
+  if (typeof item.editedText === 'string') return editedTextForInput(item);
+  return item.extractedText || (item.kind === 'text' ? '[テキスト本文は空です]' : '');
+}
+
 // This information comes from the request builder, never the model response.
 function sourceInputsForRows(rows, provider, renderedPages = {}) {
   return Object.fromEntries(rows.map(({ item, bytes }) => [item.id, {
     originalAvailable: Boolean(item.attachmentPath && bytes?.length),
     imageSent: item.kind === 'image' && Boolean(bytes?.length),
+    editedTextSent: typeof item.editedText === 'string',
+    originalTextSent: typeof item.editedText !== 'string',
     visualPages: item.kind !== 'pdf' ? [] : provider === 'openai' && bytes?.length && item.pdfPageCount
       ? item.pdfPages.map((page) => page.pageNumber)
       : provider === 'codex' ? renderedPages[item.id] || [] : []
@@ -46,7 +59,12 @@ function verifyEventQuote(event, source, inputs) {
   const quote = normalizeQuote(event.quote);
   const matches = (text) => Boolean(quote && normalizeQuote(text).includes(quote));
   assert(quote, 'イベント引用が空です。前回結果を保持しました。');
-  assert(event.quoteSource === undefined || ['text', 'image'].includes(event.quoteSource), '引用元は本文または画像を指定してください。');
+  assert(event.quoteSource === undefined || ['text', 'image', 'edited'].includes(event.quoteSource), '引用元は本文・画像・編集本文を指定してください。');
+  if (event.quoteSource === 'edited' || (event.quoteSource === undefined && typeof source.editedText === 'string' && matches(source.editedText))) {
+    assert(inputs?.editedTextSent === true && typeof source.editedText === 'string' && matches(source.editedText), '今回送信した編集本文に一致しない引用です。');
+    return { ...event, page: '', quoteSource: 'edited', quoteVerification: 'edited_text_matched', quoteOrigin: '編集した本文と一致（原本未照合）' };
+  }
+  assert(event.quoteSource === 'image' || inputs?.originalTextSent !== false, '原本の抽出本文は今回送信していません。編集本文の引用として確認してください。');
   const verified = (page, legacy = false) => ({ ...event, page, quoteSource: 'text',
     quoteVerification: legacy ? 'legacy_text_matched' : 'text_matched',
     quoteOrigin: legacy ? '旧形式の本文一致・ページ未照合' : 'テキスト抽出と原文一致' });
@@ -84,4 +102,4 @@ function verifyEventQuote(event, source, inputs) {
   return image(String(number));
 }
 
-module.exports = { PDF_METADATA_VERSION, normalizeQuote, parsePdfPage, hasPdfMetadata, pdfTextForInput, sourceInputsForRows, verifyEventQuote };
+module.exports = { PDF_METADATA_VERSION, normalizeQuote, parsePdfPage, hasPdfMetadata, pdfTextForInput, evidenceTextForInput, sourceInputsForRows, verifyEventQuote };

@@ -1,5 +1,6 @@
 const { randomUUID } = require('node:crypto');
 const { getAnalysisSources, getFixedAnalysisSources } = require('./analysisSources.cjs');
+const { enabledEvidence } = require('./evidence.mjs');
 const { INPUT_PROVENANCE_VERSION, getAnalysisContext, mayIncludeRoleProfile } = require('./analysisScope.cjs');
 const { similarity, sameActionIntent, prepareRechecks, coveredHistoryIds } = require('./actionHistory.cjs');
 const { verifyEventQuote } = require('./pdfSources.cjs');
@@ -23,12 +24,15 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
   // These input conditions are app-owned; model output cannot clear them.
   const grounding = {
     version: INPUT_PROVENANCE_VERSION,
+    inputRevision: expectedRevision,
     includeRoleProfile: options.includeRoleProfile === true,
     previousContextMayIncludeRoleProfile: context.previousContextMayIncludeRoleProfile || options.previousContextMayIncludeRoleProfile === true,
-    evidenceIds: [...evidenceIds],
+    evidenceIds: [...new Set([...evidenceIds, ...context.contextEvidenceIds])],
+    evidenceOriginUnknown: context.evidenceOriginUnknown,
     contextActionIds: context.activeActionIds,
     contextHistoryActionIds: context.historyActionIds
   };
+  const sourceSnapshots = [...getFixedAnalysisSources(current, options), ...getAnalysisSources(current, options).filter((source) => !source.id.startsWith('scenario:'))].map((source) => ({ ...source }));
 
   const validateRefs = (records, label, required = false) => {
     for (const record of records || []) {
@@ -114,6 +118,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       assumptions: assumptionsFor(action, inheritedAssumptions),
       rechecks: rechecks[index],
       grounding,
+      sourceSnapshots: sourceSnapshots.filter((source) => action.evidenceIds.includes(source.id)),
       status: 'active',
       createdAt: old ? old.createdAt : generatedAt,
       updatedAt: generatedAt
@@ -134,7 +139,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
         ...action,
         status: 'retired',
         retiredAt: generatedAt,
-        retirementReason: '役情報の送信設定により今回の更新対象から除外。内容はこのPCの履歴に保持。',
+        retirementReason: '資料・役情報の送信設定により今回の更新対象から除外。内容はこのPCの履歴に保持。',
         retirementGrounding: grounding,
         replacedByActionId: null
       });
@@ -173,7 +178,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       unknowns: output.unknowns || [],
       actions: assigned.sort((a, b) => a.priority - b.priority),
       provider: output.provider || 'AI',
-      sources: getFixedAnalysisSources(current, options),
+      sources: sourceSnapshots,
       grounding
     },
     analysisHistory: context.excludedPreviousAnalysis
@@ -184,12 +189,15 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
 }
 
 function manualNoteGrounding(action, options = {}, previousGrounding) {
+  const origins = [action.grounding, previousGrounding].filter(Boolean);
   return {
     version: INPUT_PROVENANCE_VERSION,
     includeRoleProfile: options.includeRoleProfile === true,
     previousContextMayIncludeRoleProfile: mayIncludeRoleProfile(action.grounding) ||
       Boolean(previousGrounding && mayIncludeRoleProfile(previousGrounding)),
-    evidenceIds: [...(action.grounding?.evidenceIds || [])],
+    evidenceIds: [...new Set([...origins.flatMap((origin) => origin.evidenceIds || []), ...(options.evidenceIds || [])])],
+    evidenceOriginUnknown: !action.grounding || origins.some((origin) => origin.version !== INPUT_PROVENANCE_VERSION ||
+      !Array.isArray(origin.evidenceIds) || origin.evidenceOriginUnknown === true),
     contextActionIds: [action.id], contextHistoryActionIds: [action.id]
   };
 }
@@ -207,7 +215,7 @@ function retireManually(current, actionId, status, reason, generatedAt, options)
     analysis: { ...current.analysis, actions: actions.filter((action) => action.id !== actionId) },
     actionHistory: [...(current.actionHistory || []), {
       ...selected, status, retiredAt: generatedAt, retirementReason: text,
-      retirementGrounding: text ? manualNoteGrounding(selected, options) : selected.grounding,
+      retirementGrounding: text ? manualNoteGrounding(selected, { ...options, evidenceIds: enabledEvidence(current).map((item) => item.id) }) : selected.grounding,
       replacedByActionId: null
     }]
   };
@@ -236,7 +244,7 @@ function updateActionNotes(current, actionId, notes, generatedAt = new Date().to
     updated[textField] = notes[input].trim();
     // An edited note keeps the provenance of the prose it replaces as well.
     const previous = source[textField] ? source[provenanceField] || { includeRoleProfile: true } : undefined;
-    updated[provenanceField] = manualNoteGrounding(source, options, previous);
+    updated[provenanceField] = manualNoteGrounding(source, { ...options, evidenceIds: enabledEvidence(current).map((item) => item.id) }, previous);
   }
   updated.notesUpdatedAt = generatedAt;
   history[index] = updated;
@@ -264,6 +272,7 @@ function restoreAction(current, actionId, generatedAt = new Date().toISOString()
     assumptions: source.assumptions || [],
     rechecks: source.rechecks || [],
     grounding: source.grounding,
+    sourceSnapshots: source.sourceSnapshots,
     status: 'active',
     createdAt: generatedAt,
     updatedAt: generatedAt,

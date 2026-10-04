@@ -14,7 +14,8 @@ const { createSerialLock } = require('../shared/serialLock.cjs');
 const { CodexAppServerClient, CodexAppServerError, buildCodexEnvironment } = require('./codexAppServer.cjs');
 const { prepareCodexInput, cleanupCodexInput, buildCodexDeveloperInstructions, parseStructuredResult } = require('./codexInput.cjs');
 const { extractPdfDocument, renderPdfPage } = require('./pdfDocuments.cjs');
-const { hasPdfMetadata, parsePdfPage, pdfTextForInput, sourceInputsForRows } = require('../shared/pdfSources.cjs');
+const { hasPdfMetadata, parsePdfPage, pdfTextForInput, evidenceTextForInput, sourceInputsForRows } = require('../shared/pdfSources.cjs');
+const { enabledEvidence, evidenceBody, inferEvidenceTitle, evidenceUsage } = require('../shared/evidence.mjs');
 const { accountEligibility, sanitizeCodexModels, chooseCodexModel, chooseCodexEffort, codexModelSupportsImages, summarizeRateLimits } = require('../shared/codexProvider.cjs');
 
 app.setName('幕間ノート');
@@ -35,6 +36,7 @@ let codexWorkspace = '';
 let pendingCodexLoginId = '';
 let closingCodexForQuit = false;
 const activeCodexAnalyses = new Map();
+const stagedFiles = new Map();
 
 const ANALYSIS_SCHEMA = {
   type: 'object',
@@ -43,7 +45,7 @@ const ANALYSIS_SCHEMA = {
   properties: {
     overview: { type: 'string' },
     flow: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['moment', 'summary', 'evidenceIds'], properties: { moment: { type: 'string' }, summary: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
-    events: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['timeText', 'people', 'what', 'type', 'sourceId', 'page', 'quote', 'quoteSource', 'ambiguity'], properties: { timeText: { type: 'string' }, people: { type: 'array', items: { type: 'string' } }, what: { type: 'string' }, type: { type: 'string', enum: ['observed', 'reported', 'statement', 'recorded', 'inference', 'unknown'] }, sourceId: { type: 'string' }, page: { type: 'string', description: 'PDFは原本の物理ページ番号を1始まりの数字で指定。その他は空文字。' }, quote: { type: 'string' }, quoteSource: { type: 'string', enum: ['text', 'image'], description: '抽出本文の引用はtext、抽出に含まれない画像領域の読取はimage。照合状態はアプリが決定する。' }, ambiguity: { type: 'string' } } } },
+    events: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['timeText', 'people', 'what', 'type', 'sourceId', 'page', 'quote', 'quoteSource', 'ambiguity'], properties: { timeText: { type: 'string' }, people: { type: 'array', items: { type: 'string' } }, what: { type: 'string' }, type: { type: 'string', enum: ['observed', 'reported', 'statement', 'recorded', 'inference', 'unknown'] }, sourceId: { type: 'string' }, page: { type: 'string', description: 'PDFは原本の物理ページ番号を1始まりの数字で指定。その他は空文字。' }, quote: { type: 'string' }, quoteSource: { type: 'string', enum: ['text', 'image', 'edited'], description: '抽出本文の引用はtext、画像領域はimage、利用者が編集した本文はedited。照合状態はアプリが決定する。' }, ambiguity: { type: 'string' } } } },
     facts: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'evidenceIds'], properties: { statement: { type: 'string' }, evidenceIds: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 }, description: '今回送信された実在する出典。事実は出典を1件以上必要とする。' } } } },
     hypotheses: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'why', 'evidenceIds', 'assumptions'], properties: { statement: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '想定した未公開情報など、未確認の条件。条件がなければ空配列。' } } } },
     unknowns: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['question', 'why', 'evidenceIds'], properties: { question: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
@@ -58,7 +60,7 @@ const SYSTEM_PROMPT = [
   '根拠に使えるのは、今回渡された資料IDと内容だけです。外部サイトを検索せず、既知シナリオの正解・犯人・秘密を補いません。',
   '直接資料に書かれた/見える内容を事実、読み取りや解釈を仮説、まだ決められない点を未確認事項に分けます。確率や犯人らしさの数値は出しません。公開範囲（全体公開・自分だけ・不明）は、事実/仮説/未確認と別の情報として扱います。',
   'イベント列では、元の資料の粒度を保って時刻表現、誰が/誰と、何があった/何を話したかを記録します。原文の時間表現をそのまま残し、「8時前」「夕方」「その後」等を勝手に正規化しない。同じ人物か不明な呼称を統合しない。主語省略、伝聞と直接観察、否定、期間や順序の曖昧さを勝手に補わない。各イベントに資料ID、ページ番号（不明なら空文字）、短い原文引用、曖昧な点を入れます。叙述トリックと断定せず「確認が必要な曖昧点」として扱います。',
-  'PDF引用のpageには原本の物理ページ番号を1始まりの数字だけで必ず入れます。印刷されたページラベルとは区別し、複数ページや不明なページを指定しません。テキスト資料・単独画像のpageは空文字です。quoteSourceは抽出本文の引用ならtext、抽出に含まれない画像領域を読んだ引用ならimageです。同じページの本文と画像も区別します。textの引用は該当ページの抽出原文をそのまま使い、不一致をimageへ変更して回避しません。PDFページ画像を送っていない接続先ではPDFのimage引用を作りません。照合済みかどうかは申告せず、アプリの検証に任せます。',
+  'PDF引用のpageには原本の物理ページ番号を1始まりの数字だけで必ず入れます。印刷されたページラベルとは区別し、複数ページや不明なページを指定しません。テキスト資料・単独画像のpageは空文字です。利用者が編集した本文の引用はquoteSourceをeditedにし、pageは空文字にします。編集本文を原本の照合済み引用と扱いません。その他のquoteSourceは抽出本文の引用ならtext、抽出に含まれない画像領域を読んだ引用ならimageです。同じページの本文と画像も区別します。textの引用は該当ページの抽出原文をそのまま使い、不一致をimageへ変更して回避しません。PDFページ画像を送っていない接続先ではPDFのimage引用を作りません。照合済みかどうかは申告せず、アプリの検証に任せます。',
   '証言の存在と証言内容の真偽を分けます。例「Xが20時にAにいたと発言した」は発言としての事実ですが、「Xが20時にAにいた」は独立した裏付けがない限り事実ではありません。事実欄には「Xがそう発言した」と記し、発言内容そのものは仮説/未確認のままにします。',
   '送信されたHO（ハンドアウト）に役・目的が書かれていれば読み取って利用し、別欄への再入力を前提にしません。役プロフィールは任意の補足です。どちらにもなければ役柄や目的を決めつけず、一般的な確認行動を提案します。秘密を不用意に開示しないよう、行動ごとに秘密が漏れるリスクを短く示します。',
   '各方針は次に取る具体的行動の順番です。誰へ何を聞く/発言するか、質問または短い発言例、目的への寄与を含めます。未公開の鍵・別の出入口・協力者などを一般的な可能性として想定できますが、資料にない人物名を登場人物として作らず「鍵の管理者」「協力者がいるなら」等と表現します。',
@@ -248,8 +250,16 @@ async function writeCase(record) {
   const directory = casePath(record.id);
   await fs.mkdir(directory, { recursive: true });
   const temporary = path.join(directory, 'case.json.tmp-' + randomUUID());
-  await fs.writeFile(temporary, JSON.stringify(record, null, 2), 'utf8');
-  await fs.rename(temporary, path.join(directory, 'case.json'));
+  try {
+    await fs.writeFile(temporary, JSON.stringify(record, null, 2), 'utf8');
+    for (let attempt = 0; ; attempt++) {
+      try { await fs.rename(temporary, path.join(directory, 'case.json')); break; }
+      catch (error) {
+        if (process.platform !== 'win32' || !['EPERM', 'EBUSY'].includes(error.code) || attempt >= 3) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+      }
+    }
+  } finally { await fs.rm(temporary, { force: true }); }
 }
 
 async function mutateCase(id, mutate) {
@@ -276,13 +286,14 @@ function detectFileType(filePath) {
   return null;
 }
 
-async function storeEvidence(caseRecord, bytes, originalName, kind, mimeType, extractedText, extractionStatus, extractionMessage, pdfMetadata = {}) {
+async function storeEvidence(caseRecord, bytes, originalName, kind, mimeType, extractedText, extractionStatus, extractionMessage, pdfMetadata = {}, writtenPaths = []) {
   const id = randomUUID();
   const fileName = safeName(originalName);
   const relativePath = path.join('attachments', id + '_' + fileName);
   const fullPath = path.join(casePath(caseRecord.id), relativePath);
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
-  await fs.writeFile(fullPath, bytes);
+  writtenPaths.push(fullPath);
+  await fs.writeFile(fullPath, bytes, { flag: 'wx' });
   return {
     id,
     title: fileName,
@@ -348,28 +359,26 @@ function noSecrets(message, key) {
 
 async function evidenceForRequest(caseRecord, includeRoleProfile, provider) {
   let attachmentBytes = 0;
-  let textCharacters = (caseRecord.synopsis || '').length;
   const rows = [];
-  for (const savedItem of caseRecord.evidence || []) {
+  for (const savedItem of enabledEvidence(caseRecord)) {
     let item = savedItem;
     // Fixed sources are supplied only by the app, according to their scope.
     if (item.id === SYNOPSIS_SOURCE_ID || item.id === ROLE_PROFILE_SOURCE_ID) continue;
     let bytes;
-    try { bytes = item.attachmentPath ? await fs.readFile(attachmentPath(caseRecord.id, item.attachmentPath)) : Buffer.alloc(0); }
+    try { bytes = item.attachmentPath && item.kind !== 'text' ? await fs.readFile(attachmentPath(caseRecord.id, item.attachmentPath)) : Buffer.alloc(0); }
     catch { throw new Error('「' + item.title + '」の原本を読み取れません。保存済みの本文と前回結果は保持しています。'); }
     if (item.kind === 'pdf' && !hasPdfMetadata(item) && bytes.length) {
       const metadata = await extractPdfDocument(bytes);
       item = { ...item, ...metadata, extractedText: metadata.extractedText || item.extractedText || '' };
     }
     if ((item.kind === 'pdf' || item.kind === 'image') && !bytes.length) throw new Error('「' + item.title + '」の原本がありません。保存済みの本文と前回結果は保持しています。');
-    const body = item.extractedText || '';
-    textCharacters += (item.kind === 'pdf' ? pdfTextForInput(item, provider !== 'ollama') : body).length;
+    const body = evidenceBody(item);
     attachmentBytes += bytes.length;
     rows.push({ item, bytes, text: body, fullPath: item.attachmentPath ? attachmentPath(caseRecord.id, item.attachmentPath) : '' });
   }
-  if (includeRoleProfile === true) textCharacters += JSON.stringify(caseRecord.roleProfile || {}).length;
-  if (attachmentBytes > MAX_REQUEST_FILE_BYTES) throw new Error('資料の合計がこのアプリの解析上限40MiBを超えています。資料を切り捨てず解析を停止しました。原本と前回結果は保持しています。');
-  if (textCharacters > MAX_ANALYSIS_TEXT_CHARS) throw new Error('解析対象テキストがこのアプリの上限30万文字を超えています。本文を切り詰めず解析を停止しました。原本と前回結果は保持しています。');
+  const textCharacters = evidenceUsage({ ...caseRecord, evidence: rows.map(({ item }) => item) }, includeRoleProfile).textCharacters;
+  if (attachmentBytes > MAX_REQUEST_FILE_BYTES) throw new Error('解析対象の添付が40MiBを超えています。資料一覧で不要な資料を解析対象から外すと、同じシナリオで再開できます。原本は保持しています。');
+  if (textCharacters > MAX_ANALYSIS_TEXT_CHARS) throw new Error('解析対象の本文が30万文字を超えています。資料一覧で本文を編集するか資料を解析対象から外すと、同じシナリオで再開できます。原本は保持しています。');
   return { rows, attachmentBytes, textCharacters };
 }
 
@@ -398,8 +407,9 @@ async function openAiRequest(caseRecord, preferences, requestData) {
       content.push({ type: 'input_text', text: pdfTextForInput(item, true) });
     } else if (item.kind === 'image') {
       content.push({ type: 'input_image', image_url: 'data:' + item.mimeType + ';base64,' + bytes.toString('base64'), detail: 'auto' });
+      if (typeof item.editedText === 'string') content.push({ type: 'input_text', text: evidenceTextForInput(item) });
     } else {
-      content.push({ type: 'input_text', text: text || '[テキスト本文は空です]' });
+      content.push({ type: 'input_text', text: evidenceTextForInput(item) });
     }
   }
   const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
@@ -429,8 +439,7 @@ async function ollamaRequest(caseRecord, preferences, requestData) {
   for (const { item, bytes, text } of requestData.rows) {
     userText += '\n\n' + renderEvidenceLabel(item) + '\n';
     if (item.kind === 'image') images.push(bytes.toString('base64'));
-    else if (item.kind === 'pdf') userText += pdfTextForInput(item, false);
-    else userText += text || '[本文なし]';
+    userText += evidenceTextForInput(item, false);
   }
   const active = getAnalysisContext(caseRecord, preferences.includeRoleProfile).caseRecord.analysis.actions;
   userText += '\n\n[現在有効な方針ID]\n' + JSON.stringify(active.map((a) => ({ id: a.id, title: a.title, step: a.step, rationale: a.rationale })));
@@ -463,7 +472,7 @@ async function codexRequest(caseRecord, preferences, requestData, signal) {
     const models = await readCodexModels(client);
     const model = chooseCodexModel(models, preferences.codexModel);
     const effort = chooseCodexEffort(model, preferences.codexEffort);
-    const hasVisualEvidence = (caseRecord.evidence || []).some((item) => item.kind === 'image' || item.kind === 'pdf');
+    const hasVisualEvidence = requestData.rows.some(({ item }) => item.kind === 'image' || item.kind === 'pdf');
     if (hasVisualEvidence && !codexModelSupportsImages(model)) {
       throw new CodexAppServerError('選択中のCodexモデルは画像入力に対応していません。資料を省略せず、設定で画像対応モデルを選んでください。', 'IMAGE_MODEL_REQUIRED');
     }
@@ -746,6 +755,7 @@ ipcMain.handle('scenario:delete', async (_event, id) => {
     const answer = await dialog.showMessageBox(mainWindow, { type: 'warning', title: 'シナリオと資料を削除', message: '「' + record.title + '」を削除しますか？', detail: 'このシナリオの状況・方針履歴・添付資料をこのアプリから削除します。先に残す場合はエクスポートしてください。', buttons: ['キャンセル', 'このシナリオを削除'], defaultId: 0, cancelId: 0, noLink: true });
     if (answer.response !== 1) return { deleted: false };
     await fs.rm(casePath(id), { recursive: true, force: false });
+    for (const [token, file] of stagedFiles) if (file.id === id) stagedFiles.delete(token);
     return { deleted: true };
   });
 });
@@ -758,51 +768,142 @@ ipcMain.handle('scenario:export', async (_event, id) => {
   await fs.cp(casePath(id), destination, { recursive: true, errorOnExist: true });
   return { exported: true, path: destination };
 });
-ipcMain.handle('scenario:add-text', async (_event, payload) => mutateCase(payload.id, async (current) => {
-  const text = String(payload.text ?? '');
-  if (!text) throw new Error('追加する内容を入力してください。');
-  const item = { id: randomUUID(), title: String(payload.title || 'メモ').trim().slice(0, 120) || 'メモ', kind: 'text', extractedText: text, extractionStatus: 'success', extractionMessage: '', byteSize: Buffer.byteLength(text, 'utf8'), visibility: ['shared', 'private', 'unknown'].includes(payload.visibility) ? payload.visibility : 'unknown', createdAt: new Date().toISOString() };
-  return { ...current, evidence: [...current.evidence, item], revision: current.revision + 1, updatedAt: new Date().toISOString() };
-}));
-ipcMain.handle('scenario:add-files', async (_event, id) => {
+async function chooseEvidenceFiles(id) {
+  await readCase(id);
   const selected = await dialog.showOpenDialog(mainWindow, { title: '資料を追加', properties: ['openFile', 'multiSelections'], filters: [{ name: '対応資料', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'webp', 'txt', 'md', 'markdown', 'csv', 'json'] }] });
   if (selected.canceled) return { canceled: true };
-  const beforeCount = (await readCase(id)).evidence.length;
-  const added = await mutateCase(id, async (current) => {
-    const additions = [];
-    for (const sourcePath of selected.filePaths) {
-      const type = detectFileType(sourcePath);
-      if (!type) continue;
+  await readCase(id);
+  const files = [];
+  for (const sourcePath of selected.filePaths) {
+    const token = randomUUID();
+    const type = detectFileType(sourcePath);
+    const candidate = { token, name: safeName(sourcePath), kind: type?.kind || 'text', byteSize: 0 };
+    try {
       const stat = await fs.stat(sourcePath);
-      if (stat.size > MAX_FILE_BYTES) throw new Error(safeName(sourcePath) + ' はこのアプリの取り込み上限20MiBを超えています。取り込みを停止しました。');
-      const buffer = await fs.readFile(sourcePath);
-      let extracted = '';
-      let status = type.kind === 'pdf' ? 'error' : type.kind === 'text' ? 'success' : 'not_applicable';
-      let message = '';
-      let pdfMetadata = {};
-      if (type.kind === 'text') extracted = buffer.toString('utf8').replace(/^\uFEFF/, '');
-      if (type.kind === 'pdf') {
-        pdfMetadata = await extractPdfDocument(buffer);
-        extracted = pdfMetadata.extractedText;
-        status = pdfMetadata.extractionStatus;
-        message = pdfMetadata.extractionMessage;
-      }
-      additions.push(await storeEvidence(current, buffer, path.basename(sourcePath), type.kind, type.mimeType, extracted, status, message, pdfMetadata));
-    }
-    if (!additions.length) return current;
-    return { ...current, evidence: [...current.evidence, ...additions], revision: current.revision + 1, updatedAt: new Date().toISOString() };
-  });
-  return { canceled: false, scenario: added, addedCount: added.evidence.length - beforeCount };
-});
-ipcMain.handle('scenario:add-pasted-image', async (_event, payload) => mutateCase(payload.id, async (current) => {
-  const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(payload.dataUrl || ''));
+      candidate.byteSize = stat.size;
+      if (!type || !stat.isFile()) throw new Error('対応していない資料です。');
+      if (stat.size > MAX_FILE_BYTES) throw new Error('取り込み上限20MiBを超えています。');
+    } catch (error) { candidate.error = error.message; }
+    stagedFiles.set(token, { id, sourcePath, candidate });
+    files.push(candidate);
+  }
+  return { canceled: false, files };
+}
+
+function pastedImageBytes(dataUrl) {
+  const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ''));
   if (!match) throw new Error('貼り付け画像の形式を読み取れませんでした。PNG/JPEG/WebPを使ってください。');
+  if (match[2].length > Math.ceil(MAX_FILE_BYTES / 3) * 4) throw new Error('画像は20MiB以下にしてください。');
   const bytes = Buffer.from(match[2], 'base64');
-  if (!bytes.length || bytes.length > MAX_FILE_BYTES) throw new Error('画像は20MB以下にしてください。');
+  if (!bytes.length || bytes.length > MAX_FILE_BYTES) throw new Error('画像は20MiB以下にしてください。');
   const extension = match[1].split('/')[1].replace('jpeg', 'jpg');
-  const evidence = await storeEvidence(current, bytes, '貼り付け画像.' + extension, 'image', match[1], '', 'not_applicable', '画像データを保存しました。');
-  evidence.visibility = ['shared', 'private', 'unknown'].includes(payload.visibility) ? payload.visibility : 'unknown';
-  return { ...current, evidence: [...current.evidence, evidence], revision: current.revision + 1, updatedAt: new Date().toISOString() };
+  return { bytes, kind: 'image', mimeType: match[1], name: '貼り付け画像.' + extension };
+}
+
+async function addEvidence(payload) {
+  return withCaseLock(payload.id, async () => {
+    const current = await readCase(payload.id);
+    const tokens = payload.fileTokens || [];
+    const images = payload.images || [];
+    if (!Array.isArray(tokens) || !Array.isArray(images) || new Set(tokens).size !== tokens.length) throw new Error('追加候補を確認できません。');
+    const pending = [];
+    // Complete preflight before writing any originals; a failing candidate keeps the whole draft.
+    for (const token of tokens) {
+      const file = stagedFiles.get(token);
+      if (!file || file.id !== current.id) throw new Error('このシナリオの選択済みファイルを確認できません。選び直してください。');
+      const type = detectFileType(file.sourcePath);
+      const stat = await fs.stat(file.sourcePath);
+      if (!type || !stat.isFile()) throw new Error(file.candidate.name + ' は対応していない資料です。');
+      if (stat.size > MAX_FILE_BYTES) throw new Error(file.candidate.name + ' は取り込み上限20MiBを超えています。候補から外して再追加できます。');
+      const bytes = await fs.readFile(file.sourcePath);
+      if (bytes.length > MAX_FILE_BYTES) throw new Error(file.candidate.name + ' は20MiBを超えています。');
+      pending.push({ ...type, bytes, name: file.candidate.name });
+    }
+    for (const image of images) pending.push({ ...pastedImageBytes(image.dataUrl), title: image.title });
+    const text = String(payload.text ?? '');
+    if (!text.trim() && !pending.length) throw new Error('本文、ファイル、画像のいずれかを追加してください。');
+    const now = new Date().toISOString();
+    const visibility = ['shared', 'private', 'unknown'].includes(payload.visibility) ? payload.visibility : 'unknown';
+    const additions = [];
+    if (text.trim()) additions.push({ id: randomUUID(), title: inferEvidenceTitle(payload.title, text), kind: 'text', extractedText: text,
+      extractionStatus: 'success', extractionMessage: '', byteSize: Buffer.byteLength(text, 'utf8'), visibility, createdAt: now });
+    const writtenPaths = [];
+    try {
+      for (const input of pending) {
+        const pdf = input.kind === 'pdf' ? await extractPdfDocument(input.bytes) : {};
+        const body = input.kind === 'text' ? input.bytes.toString('utf8').replace(/^\uFEFF/, '') : pdf.extractedText || '';
+        const item = await storeEvidence(current, input.bytes, input.name, input.kind, input.mimeType, body,
+          pdf.extractionStatus || (input.kind === 'text' ? 'success' : 'not_applicable'), pdf.extractionMessage || '', pdf, writtenPaths);
+        item.title = inferEvidenceTitle(input.title, body, input.name);
+        item.visibility = visibility;
+        additions.push(item);
+      }
+      const next = { ...current, evidence: [...current.evidence, ...additions], revision: current.revision + 1, updatedAt: now };
+      await writeCase(next);
+      tokens.forEach((token) => stagedFiles.delete(token));
+      return next;
+    } catch (error) {
+      await Promise.all(writtenPaths.map((file) => fs.rm(file, { force: true })));
+      throw error;
+    }
+  });
+}
+
+ipcMain.handle('scenario:choose-files', async (_event, id) => chooseEvidenceFiles(id));
+ipcMain.handle('scenario:release-files', async (_event, payload) => {
+  for (const token of payload.tokens || []) if (stagedFiles.get(token)?.id === payload.id) stagedFiles.delete(token);
+});
+ipcMain.handle('scenario:add-evidence', async (_event, payload) => addEvidence(payload));
+ipcMain.handle('scenario:add-text', async (_event, payload) => addEvidence(payload));
+ipcMain.handle('scenario:add-pasted-image', async (_event, payload) => addEvidence({ ...payload, images: [{ dataUrl: payload.dataUrl }] }));
+ipcMain.handle('scenario:add-files', async (_event, id) => {
+  const selected = await chooseEvidenceFiles(id);
+  if (selected.canceled) return selected;
+  const scenario = await addEvidence({ id, fileTokens: selected.files.map((file) => file.token) });
+  return { canceled: false, scenario, addedCount: selected.files.length };
+});
+
+function preserveAnalysisSources(current) {
+  if (!current.analysis) return current;
+  const sources = current.analysis.sources || [];
+  const referencedIds = new Set([...(current.analysis.grounding?.evidenceIds || []),
+    ...(current.analysis.events || []).map((event) => event.sourceId),
+    ...['flow', 'facts', 'hypotheses', 'unknowns', 'actions'].flatMap((key) => (current.analysis[key] || []).flatMap((entry) => entry.evidenceIds || []))]);
+  const missing = (current.evidence || []).filter((item) => !sources.some((source) => source.id === item.id) &&
+    referencedIds.has(item.id));
+  const analysis = { ...current.analysis, sources: [...sources, ...missing.map((item) => ({ ...item }))] };
+  const attachSources = (action) => action.sourceSnapshots ? action : {
+    ...action, sourceSnapshots: analysis.sources.filter((source) => (action.evidenceIds || []).includes(source.id))
+  };
+  analysis.actions = (analysis.actions || []).map(attachSources);
+  const history = (current.analysisHistory || []).some((old) => old.revision === analysis.revision && old.updatedAt === analysis.updatedAt)
+    ? current.analysisHistory : [...(current.analysisHistory || []), analysis];
+  return { ...current, analysis, analysisHistory: history,
+    actionHistory: (current.actionHistory || []).map((action) => Number.isSafeInteger(action.grounding?.inputRevision) &&
+      JSON.stringify(action.grounding) === JSON.stringify(analysis.grounding) ? attachSources(action) : action) };
+}
+
+ipcMain.handle('scenario:edit-evidence', async (_event, payload) => mutateCase(payload.id, (current) => {
+  const saved = current.evidence.find((item) => item.id === payload.evidenceId);
+  if (!saved) throw new Error('資料が見つかりません。');
+  if (payload.expectedUpdatedAt !== (saved.updatedAt || saved.createdAt)) throw new Error('この資料は別の操作で変更されています。編集内容は下書きに残っています。');
+  if (typeof payload.text !== 'string' || typeof payload.title !== 'string') throw new Error('見出しと本文を確認できません。');
+  const before = preserveAnalysisSources(current);
+  const now = new Date().toISOString();
+  return { ...before, evidence: before.evidence.map((item) => item.id !== saved.id ? item : {
+    ...item, originalTitle: item.originalTitle ?? item.title, title: inferEvidenceTitle(payload.title, payload.text, item.originalName),
+    editedText: payload.text, updatedAt: now
+  }), revision: current.revision + 1, updatedAt: now };
+}));
+ipcMain.handle('scenario:set-evidence-enabled', async (_event, payload) => mutateCase(payload.id, (current) => {
+  if (typeof payload.enabled !== 'boolean') throw new Error('解析対象の状態を確認できません。');
+  const saved = current.evidence.find((item) => item.id === payload.evidenceId);
+  if (!saved) throw new Error('資料が見つかりません。');
+  if ((saved.analysisEnabled !== false) === payload.enabled) return current;
+  const before = preserveAnalysisSources(current);
+  const now = new Date().toISOString();
+  return { ...before, evidence: before.evidence.map((item) => item.id !== saved.id ? item : { ...item, analysisEnabled: payload.enabled }),
+    revision: current.revision + 1, updatedAt: now };
 }));
 ipcMain.handle('scenario:set-visibility', async (_event, payload) => mutateCase(payload.id, (current) => {
   if (!['shared', 'private', 'unknown'].includes(payload.visibility)) throw new Error('公開範囲を選んでください。');
@@ -830,10 +931,17 @@ ipcMain.handle('scenario:read-source', async (_event, payload) => {
   }
   const analysis = payload.analysisIndex === undefined ? record.analysis : history[payload.analysisIndex];
   const fallbackSources = payload.analysisIndex === undefined ? history.slice().reverse().flatMap((entry) => entry.sources || []) : [];
-  const item = (record.evidence || []).find((entry) => entry.id !== SYNOPSIS_SOURCE_ID && entry.id !== ROLE_PROFILE_SOURCE_ID && entry.id === payload.evidenceId) ||
-    analysis?.sources?.find((entry) => entry.id === payload.evidenceId) || fallbackSources.find((entry) => entry.id === payload.evidenceId);
+  const action = payload.actionId ? [...(record.analysis?.actions || []), ...(record.actionHistory || [])].find((entry) => entry.id === payload.actionId) : null;
+  if (payload.actionId && !action) throw new Error('出典を開く行動が見つかりません。');
+  const snapshot = payload.current === true ? null : action?.sourceSnapshots?.find((entry) => entry.id === payload.evidenceId) ||
+    (action ? (Number.isSafeInteger(action.grounding?.inputRevision) ? [record.analysis, ...history].find((entry) => entry?.inputRevision === action.grounding.inputRevision)?.sources?.find((entry) => entry.id === payload.evidenceId) : undefined) :
+      analysis?.sources?.find((entry) => entry.id === payload.evidenceId) || fallbackSources.find((entry) => entry.id === payload.evidenceId));
+  const item = snapshot || (record.evidence || []).find((entry) => entry.id !== SYNOPSIS_SOURCE_ID && entry.id !== ROLE_PROFILE_SOURCE_ID && entry.id === payload.evidenceId);
   if (!item) throw new Error('資料が見つかりません。');
-  const base = { title: item.title, kind: item.kind, text: item.extractedText || '', dataUrl: '', pageNumber: null, pageCount: null, pdfPages: [], extractionMessage: item.extractionMessage || '' };
+  const snapshotUnavailable = !snapshot && payload.current !== true && Boolean(action || analysis || payload.analysisIndex !== undefined);
+  const base = { title: snapshotUnavailable ? item.originalTitle || item.title : item.title, kind: item.kind, text: item.extractedText || '',
+    editedText: snapshotUnavailable ? undefined : item.editedText, snapshot: Boolean(snapshot), snapshotUnavailable,
+    dataUrl: '', pageNumber: null, pageCount: null, pdfPages: [], extractionMessage: item.extractionMessage || '' };
   if (item.kind === 'text') return base;
   let bytes;
   try {

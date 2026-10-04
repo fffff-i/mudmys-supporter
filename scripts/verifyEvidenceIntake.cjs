@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 // Run after npm run build. All scenarios, browser state and reports stay under
 // this checkout's .local directory; Electron and actual AI are never started.
 const root = path.resolve(__dirname, '..');
-const qaDir = path.join(root, '.local', 'scenario-drafts-ui');
+const qaDir = path.join(root, '.local', 'evidence-intake-ui');
 const runDir = path.join(qaDir, 'run-' + Date.now());
 const data = path.join(runDir, 'synthetic-data');
 const browserProfile = path.join(runDir, 'headless-profile');
@@ -25,11 +25,12 @@ let evaluate;
 let browserCommand;
 let syntheticAutoUpdate = false;
 let browserLog;
+let nextChosenPaths = [];
 const realRequire = createRequire(path.join(root, 'electron/main.cjs'));
 const methods = {
   listScenarios: 'scenario:list', getScenario: 'scenario:get', getSettings: 'settings:get',
   createScenario: 'scenario:create', createDemo: 'scenario:create-demo', saveProfile: 'scenario:save-profile',
-  addEvidence: 'scenario:add-evidence', analyze: 'scenario:analyze', cancelAnalysis: 'scenario:cancel-analysis'
+  addEvidence: 'scenario:add-evidence', chooseFiles: 'scenario:choose-files', releaseFiles: 'scenario:release-files', editEvidence: 'scenario:edit-evidence', setEvidenceEnabled: 'scenario:set-evidence-enabled', readSource: 'scenario:read-source', analyze: 'scenario:analyze', cancelAnalysis: 'scenario:cancel-analysis'
 };
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function findBrowser() {
@@ -64,7 +65,7 @@ async function boot() {
     app: { setName() {}, getPath: () => data, getVersion: () => '0.2.1', whenReady: () => ({ then() {} }), on() {} },
     BrowserWindow: class { constructor() { throw new Error('GUI launch forbidden'); } },
     ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
-    dialog: { showOpenDialog: async () => { throw new Error('Native dialog forbidden'); }, showMessageBox: async () => ({ response: 0 }) },
+    dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: nextChosenPaths }), showMessageBox: async () => ({ response: 0 }) },
     safeStorage: { isEncryptionAvailable: () => false },
     shell: { openPath: async () => { throw new Error('Shell opening forbidden'); } }
   };
@@ -198,102 +199,107 @@ async function caseReport(name, body) { await body(); reports.push({ name, passe
 const saved = (id) => invoke('scenario:get', id);
 const count = (method) => calls.filter((call) => call.name === method).length;
 
+async function pasteImages(count = 1, text = '') {
+  await evaluate('(() => { const canvas=document.createElement("canvas"); canvas.width=2; canvas.height=2; canvas.getContext("2d").fillRect(0,0,2,2); const bytes=Uint8Array.from(atob(canvas.toDataURL("image/png").split(",")[1]), c=>c.charCodeAt(0)); const data=new DataTransfer(); for(let i=0;i<' + count + ';i++) data.items.add(new File([bytes],"synthetic.png",{type:"image/png"})); if(' + JSON.stringify(text) + ') data.setData("text/plain",' + JSON.stringify(text) + '); document.querySelector(".add-note-panel").dispatchEvent(new ClipboardEvent("paste",{clipboardData:data,bubbles:true,cancelable:true})); })()');
+}
+async function candidates() { return evaluate('Array.from(document.querySelectorAll(".intake-candidates li")).map(e=>({name:e.querySelector("strong").textContent,loading:e.textContent.includes("読込中")}))'); }
+async function openItem(id) { await evaluate('document.getElementById("evidence-"+' + JSON.stringify(id) + ').querySelector(".evidence-toggle").click()'); }
+async function editDetails(id) { await evaluate('document.getElementById("evidence-"+' + JSON.stringify(id) + ').querySelector(".evidence-edit").open=true'); }
 async function verify() {
-  const { a, b, command } = await boot();
+  syntheticAutoUpdate = true;
+  const { a, b } = await boot();
+  const fixtures = path.join(runDir, 'fixtures'); await fs.mkdir(fixtures, {recursive:true});
+  const fileOne = path.join(fixtures, 'HO.md'); const fileTwo = path.join(fixtures, 'clue.txt');
+  await fs.writeFile(fileOne, 'Role and goal are already in this synthetic HO.'); await fs.writeFile(fileTwo, 'A synthetic file clue.');
   await evidence();
-  await caseReport('unsaved text, scope and all profile fields survive A/B switching without mixing', async () => {
-    await note('A unsaved heading', 'A unsaved private clue');
-    await fill(selectors.profileTitle, 'A unsaved title'); await fill(selectors.synopsis, 'A unsaved synopsis');
-    await fill(selectors.role, 'A unsaved role'); await fill(selectors.goal, 'A unsaved goal'); await fill(selectors.secret, 'A unsaved secret');
-    await select('Synthetic B');
-    let visible = await state(); assert.equal(visible.text, ''); assert.equal(visible.title, ''); assert.equal(visible.visibility, 'unknown'); assert.equal(visible.secret, '');
-    await submit('text'); assert.equal((await saved(b.id)).evidence.length, 0);
-    await note('B unsaved heading', 'B unsaved clue', 'shared'); await fill(selectors.secret, 'B unsaved secret');
-    await select('Synthetic A'); visible = await state();
-    assert.deepEqual([visible.title, visible.text, visible.visibility, visible.profileTitle, visible.synopsis, visible.role, visible.goal, visible.secret],
-      ['A unsaved heading', 'A unsaved private clue', 'private', 'A unsaved title', 'A unsaved synopsis', 'A unsaved role', 'A unsaved goal', 'A unsaved secret']);
+  await caseReport('typing, multiple file selection and multiple image paste never save or analyze before explicit confirmation', async () => {
+    await fill(selectors.text, 'A batch heading\nA original text');
+    nextChosenPaths=[fileOne,fileTwo]; await evaluate('document.querySelector(".drop-zone").click()');
+    await until(async()=> (await candidates()).length===2,'two selected files');
+    await pasteImages(2); await until(async()=> (await candidates()).length===4 && !(await candidates()).some(e=>e.loading),'two pasted images');
+    assert.equal((await saved(a.id)).evidence.length,0); assert.equal(count('analyze'),0); assert.equal(count('addEvidence'),0);
+    await evaluate('document.querySelector(".add-note-panel textarea").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",ctrlKey:true,isComposing:true,bubbles:true,cancelable:true}))');
+    await delay(50); assert.equal(count('addEvidence'),0);
+    await evaluate('document.querySelector(".add-note-panel input").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true,cancelable:true}))');
+    await delay(50); assert.equal(count('addEvidence'),0);
+    const revision=(await saved(a.id)).revision;
+    await evaluate('document.querySelector(".add-note-panel textarea").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",ctrlKey:true,bubbles:true,cancelable:true}))');
+    await until(async()=> (await saved(a.id)).evidence.length===5 && count('analyze')===1,'one explicit batch');
+    const record=await saved(a.id); assert.equal(record.revision,revision+1); assert.equal(record.evidence[0].title,'A batch heading'); assert.ok(record.evidence.every(e=>e.visibility==='unknown'));
+    assert.equal(record.roleProfile.role,''); assert.equal(count('addEvidence'),1);
+    await until(async()=> (await state()).text==='' && (await candidates()).length===0,'consumed batch draft');
   });
-  await caseReport('a pending scenario load already displays the destination draft and preserves new typing', async () => {
-    const gate = hold('getScenario', 'after'); await select('Synthetic B'); await until(() => gate.entered, 'B get entered');
-    await note('B while loading', 'B typed while loading', 'shared'); gate.release();
-    await until(async () => (await state()).text === 'B typed while loading', 'B input retained');
-    await select('Synthetic A'); assert.equal((await state()).text, 'A unsaved private clue');
+  await caseReport('file selection completed after a scenario switch belongs only to the initiating draft', async()=>{
+    nextChosenPaths=[fileOne]; const gate=hold('chooseFiles','after'); await evaluate('document.querySelector(".drop-zone").click()'); await until(()=>gate.entered,'A chooser entered');
+    await select('Synthetic B'); await fill(selectors.text,'B own draft'); gate.release(); await delay(100);
+    assert.equal((await candidates()).length,0); assert.equal((await state()).text,'B own draft');
+    await select('Synthetic A'); await until(async()=> (await candidates()).length===1,'A selected candidate'); assert.equal((await state()).text,'');
+    await evaluate('document.querySelector(".intake-candidates button").click()'); await until(async()=> (await candidates()).length===0,'candidate removed');
   });
-  await caseReport('successful save after switching clears A only and persists the clue under A', async () => {
-    const gate = hold('addEvidence'); await submit('text'); await until(() => gate.entered, 'A save entered');
-    await select('Synthetic B'); gate.release(); await until(async () => (await saved(a.id)).evidence.length === 1, 'A saved');
-    assert.equal((await saved(b.id)).evidence.length, 0); assert.equal((await state()).text, 'B typed while loading');
-    await select('Synthetic A'); const visible = await state(); assert.equal(visible.text, ''); assert.equal(visible.title, ''); assert.equal(visible.visibility, 'private');
-    const record = await saved(a.id); assert.equal(record.evidence[0].extractedText, 'A unsaved private clue'); assert.equal(record.evidence[0].visibility, 'private');
+  await caseReport('asynchronous image reads remain in A after switching and removed loading images are never revived', async()=>{
+    await evaluate('window.qaReaders=[]; window.qaNativeReader=window.FileReader; window.FileReader=class extends window.qaNativeReader { readAsDataURL(file) { window.qaReaders.push(()=>super.readAsDataURL(file)); } };');
+    await pasteImages(); await until(async()=> (await candidates()).some(e=>e.loading),'A loading image'); assert.equal((await state()).textDisabled,true);
+    await select('Synthetic B'); await evaluate('window.qaReaders.shift()()'); await delay(80); assert.equal((await candidates()).length,0);
+    await select('Synthetic A'); await until(async()=> (await candidates()).length===1 && !(await candidates())[0].loading,'A image ready');
+    await evaluate('document.querySelector(".intake-candidates button").click()'); await until(async()=> (await candidates()).length===0,'A image removed');
+    await pasteImages(); await until(async()=> (await candidates()).length===1,'new loading image');
+    await evaluate('document.querySelector(".intake-candidates button").click(); window.qaReaders.shift()(); window.FileReader=window.qaNativeReader;'); await delay(80);
+    assert.equal((await candidates()).length,0); assert.equal((await saved(a.id)).evidence.length,5);
   });
-  await caseReport('returning before completion blocks duplicate submission and refreshes the current A result', async () => {
-    await note('A delayed heading', 'A delayed clue'); const gate = hold('addEvidence'); const before = count('addEvidence');
-    await submit('text'); await until(() => gate.entered, 'A second save entered'); await select('Synthetic B'); await select('Synthetic A');
-    assert.equal((await state()).textDisabled, true); await submit('text'); await delay(40); assert.equal(count('addEvidence'), before + 1);
-    gate.release(); await until(async () => (await state()).text === '' && (await state()).evidence.includes('A delayed heading'), 'A current result and cleared draft');
-    assert.equal((await saved(a.id)).evidence.length, 2);
+  await caseReport('saving after A/B/A consumes only sent candidates and preserves newer text and images', async()=>{
+    await fill(selectors.text,'A submitted batch'); await pasteImages(); await until(async()=> (await candidates()).length===1 && !(await candidates())[0].loading,'submitted image ready');
+    const gate=hold('addEvidence'); const before=count('addEvidence'); await submit('text'); await until(()=>gate.entered,'batch save entered');
+    await select('Synthetic B'); await select('Synthetic A'); await submit('text'); await delay(40); assert.equal(count('addEvidence'),before+1);
+    await fill(selectors.text,'A later unsaved text'); await pasteImages(); await until(async()=> (await candidates()).length===2 && !(await candidates()).some(e=>e.loading),'later image ready');
+    gate.release(); await until(async()=> (await saved(a.id)).evidence.length===7 && !(await state()).textDisabled,'batch saved');
+    assert.equal((await state()).text,'A later unsaved text'); assert.equal((await candidates()).length,1);
+    await select('Synthetic B'); assert.equal((await state()).text,'B own draft'); assert.equal((await candidates()).length,0);
+    await select('Synthetic A'); assert.equal((await state()).text,'A later unsaved text');
   });
-  await caseReport('text edited after returning during a save remains unsaved and never replaces the submitted clue', async () => {
-    await note('A sent heading', 'A sent clue'); const gate = hold('addEvidence'); await submit('text'); await until(() => gate.entered, 'A third save entered');
-    await select('Synthetic B'); await select('Synthetic A'); await note('A next heading', 'A next unsaved clue', 'unknown'); gate.release();
-    await until(async () => (await state()).evidence.includes('A sent heading') && !(await state()).textDisabled, 'A saved and unlocked');
-    const visible = await state(); assert.deepEqual([visible.title, visible.text, visible.visibility], ['A next heading', 'A next unsaved clue', 'unknown']);
-    assert.equal((await saved(a.id)).evidence.at(-1).extractedText, 'A sent clue');
+  await caseReport('failed saving keeps all staged input and can be retried without partial registration', async()=>{
+    const gate=hold('addEvidence','before',true); await submit('text'); await until(()=>gate.entered,'failure entered');
+    await select('Synthetic B'); gate.release(); await delay(80); assert.equal((await state()).error,'');
+    await select('Synthetic A'); assert.equal((await state()).text,'A later unsaved text'); assert.equal((await candidates()).length,1);
+    assert.equal((await saved(a.id)).evidence.length,7); await submit('text'); await until(async()=> (await saved(a.id)).evidence.length===9 && (await candidates()).length===0,'retry saved');
   });
-  await caseReport('a failed save while away retains A input and leaves B input and messages intact', async () => {
-    const gate = hold('addEvidence', 'before', true); await submit('text'); await until(() => gate.entered, 'failed A save entered');
-    await select('Synthetic B'); gate.release(); await delay(80); assert.equal((await state()).error, ''); assert.equal((await state()).text, 'B typed while loading');
-    await select('Synthetic A'); assert.equal((await state()).text, 'A next unsaved clue'); assert.equal((await state()).textDisabled, false);
+  await caseReport('oversize candidates are removable without losing valid candidates or typed text', async()=>{
+    const oversized=path.join(fixtures,'too-large.png'); await fs.writeFile(oversized,Buffer.alloc(20*1024*1024+1));
+    nextChosenPaths=[fileTwo,oversized]; await fill(selectors.text,'A preserved for recovery'); await evaluate('document.querySelector(".drop-zone").click()');
+    await until(async()=> (await candidates()).length===2,'oversized candidate visible'); assert.equal((await state()).textDisabled,true);
+    assert.equal((await saved(a.id)).evidence.length,9);
+    await evaluate('document.querySelectorAll(".intake-candidates button")[1].click()'); await until(async()=> !(await state()).textDisabled,'valid batch enabled');
+    assert.equal((await state()).text,'A preserved for recovery'); await submit('text'); await until(async()=> (await saved(a.id)).evidence.length===11,'same-scenario recovery');
   });
-  await caseReport('profile saved while away restores normalized A values and preserves B profile edits', async () => {
-    await fill(selectors.profileTitle, '  A saved title  '); const gate = hold('saveProfile'); await submit('profile'); await until(() => gate.entered, 'A profile save entered');
-    await select('Synthetic B'); gate.release(); await until(async () => (await saved(a.id)).title === 'A saved title', 'A profile saved');
-    assert.equal((await state()).secret, 'B unsaved secret'); await select('A saved title');
-    const visible = await state(); assert.equal(visible.profileTitle, 'A saved title'); assert.equal(visible.secret, 'A unsaved secret'); assert.equal(visible.synopsis, 'A unsaved synopsis');
-    assert.equal((await saved(b.id)).roleProfile.secret, ''); assert.equal(visible.text, 'A next unsaved clue');
+  await caseReport('body/title edits survive switching and retain later edits made while saving', async()=>{
+    const item=(await saved(a.id)).evidence[0]; await openItem(item.id); await editDetails(item.id);
+    const editor='#evidence-'+item.id+' .evidence-edit';
+    await fill(editor+' input','A edited source name'); await fill(editor+' textarea','A edited body');
+    await select('Synthetic B'); await select('Synthetic A'); await openItem(item.id); await editDetails(item.id);
+    assert.equal(await evaluate('document.querySelector('+JSON.stringify(editor+' textarea')+').value'),'A edited body');
+    const gate=hold('editEvidence'); await evaluate('document.querySelector('+JSON.stringify(editor+' form')+').dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}))'); await until(()=>gate.entered,'edit saved entered');
+    await select('Synthetic B'); await select('Synthetic A'); await openItem(item.id); await editDetails(item.id); await fill(editor+' textarea','A later edit draft'); gate.release();
+    await until(async()=> (await saved(a.id)).evidence[0].editedText==='A edited body','edit saved');
+    await until(()=> evaluate('!document.querySelector('+JSON.stringify(editor+' button[type=submit]')+').disabled'),'edit unlocked');
+    assert.equal(await evaluate('document.querySelector('+JSON.stringify(editor+' textarea')+').value'),'A later edit draft');
+    assert.equal((await saved(a.id)).evidence[0].extractedText,'A batch heading\nA original text');
+    await evaluate('document.querySelector('+JSON.stringify(editor+' form')+').dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}))');
+    await until(async()=> (await saved(a.id)).evidence[0].editedText==='A later edit draft','later edit saved');
   });
-  await caseReport('profile completion after A/B/A keeps later secret edits and refreshes the saved scenario title', async () => {
-    await fill(selectors.profileTitle, 'A profile version 2'); await fill(selectors.secret, 'A sent secret v2');
-    const gate = hold('saveProfile'); await submit('profile'); await until(() => gate.entered, 'A profile v2 entered');
-    await select('Synthetic B'); await select('A saved title'); assert.equal((await state()).profileDisabled, true);
-    await fill(selectors.secret, 'A edited secret after submit'); gate.release();
-    await until(async () => (await state()).heading === 'A profile version 2' && !(await state()).profileDisabled, 'profile current result');
-    assert.equal((await state()).secret, 'A edited secret after submit'); assert.equal((await saved(a.id)).roleProfile.secret, 'A sent secret v2');
-    await select('Synthetic B'); await select('A profile version 2'); assert.equal((await state()).secret, 'A edited secret after submit');
+  await caseReport('exclude and restore remain ordinary detail actions and retain originals and visible edited content', async()=>{
+    const image=(await saved(a.id)).evidence.find(e=>e.kind==='image'); await openItem(image.id);
+    await evaluate('document.getElementById("evidence-"+'+JSON.stringify(image.id)+').querySelector(".evidence-enabled").click()');
+    await until(async()=> (await saved(a.id)).evidence.find(e=>e.id===image.id).analysisEnabled===false,'excluded');
+    assert.ok(await fs.stat(path.join(data,'cases',a.id,image.attachmentPath)));
+    assert.equal(await evaluate('document.getElementById("evidence-"+'+JSON.stringify(image.id)+').textContent.includes("解析対象外")'),true);
+    await evaluate('document.getElementById("evidence-"+'+JSON.stringify(image.id)+').querySelector(".evidence-enabled").click()');
+    await until(async()=> (await saved(a.id)).evidence.find(e=>e.id===image.id).analysisEnabled===true,'restored');
+    assert.ok(await fs.stat(path.join(data,'cases',a.id,image.attachmentPath)));
   });
-  await caseReport('failed profile save keeps edits after switching and permits retry', async () => {
-    const gate = hold('saveProfile', 'before', true); await submit('profile'); await until(() => gate.entered, 'failed profile entered');
-    await select('Synthetic B'); gate.release(); await delay(80); await select('A profile version 2');
-    assert.equal((await state()).secret, 'A edited secret after submit'); assert.equal((await state()).profileDisabled, false);
-    await submit('profile'); await until(async () => (await saved(a.id)).roleProfile.secret === 'A edited secret after submit', 'profile retry');
-  });
-  await caseReport('a stale load from B cannot replace the selected A form or its secrets', async () => {
-    const gate = hold('getScenario', 'after'); await select('Synthetic B'); await until(() => gate.entered, 'stale B load entered');
-    await select('A profile version 2'); gate.release(); await delay(100);
-    const visible = await state(); assert.equal(visible.heading, 'A profile version 2'); assert.equal(visible.secret, 'A edited secret after submit'); assert.equal(visible.text, 'A next unsaved clue');
-  });
-  await caseReport('the fresh read after a stale save remains guarded if the user switches again', async () => {
-    const saving = hold('addEvidence'); await submit('text'); await until(() => saving.entered, 'save before fresh read entered');
-    await select('Synthetic B'); await select('A profile version 2'); const reading = hold('getScenario', 'after'); saving.release();
-    await until(() => reading.entered, 'fresh read entered'); await select('Synthetic B'); reading.release(); await delay(100);
-    const visible = await state(); assert.equal(visible.heading, 'Synthetic B'); assert.equal(visible.text, 'B typed while loading'); assert.equal(visible.secret, 'B unsaved secret');
-    await select('A profile version 2'); assert.equal((await state()).text, '');
-  });
-  await caseReport('automatic analysis receives the destination ID and only that scenario gets its submitted text', async () => {
-    syntheticAutoUpdate = true; await command('Page.reload'); await until(() => evaluate("Boolean(document.querySelector('.topbar-title'))"), 'reloaded app');
-    await until(() => evaluate("document.querySelector('.topbar-title')?.textContent === 'A profile version 2'"), 'A after reload');
-    await evidence(); await note('A auto unsaved', 'A auto private draft'); await select('Synthetic B');
-    assert.equal((await state()).text, ''); await note('B auto heading', 'B auto clue', 'shared'); await submit('text');
-    await until(() => calls.some((call) => call.name === 'analyze' && call.args[0].id === b.id), 'mock B auto analysis');
-    assert.equal((await saved(b.id)).evidence.length, 1); assert.equal((await saved(b.id)).evidence[0].extractedText, 'B auto clue');
-    assert.equal((await saved(a.id)).evidence.some((entry) => entry.extractedText === 'A auto private draft'), false);
-    await select('A profile version 2'); assert.equal((await state()).text, 'A auto private draft');
-  });
-  assert.deepEqual(errors, []); assert.deepEqual(await evaluate('window.qaErrors'), []);
-  assert.equal(calls.filter((call) => call.name === 'addEvidence').every((call) => !call.args[0].text.startsWith('A ') || call.args[0].id === a.id), true);
-  const report = { passed: reports.length, reports, browserErrors: errors, data, root, calls };
-  await fs.writeFile(path.join(qaDir, 'results.json'), JSON.stringify(report, null, 2));
-  console.log(JSON.stringify({ passed: reports.length, browserErrors: errors, data, report: path.join(qaDir, 'results.json') }));
+  assert.deepEqual(errors,[]); assert.deepEqual(await evaluate('window.qaErrors'),[]);
+  assert.equal(calls.filter(call=>call.name==='addEvidence').every(call=>call.args[0].id===a.id),true);
+  await fs.mkdir(qaDir,{recursive:true}); const reportPath=path.join(qaDir,'results.json');
+  await fs.writeFile(reportPath,JSON.stringify({passed:reports.length,reports,browserErrors:errors,data,root,calls},null,2));
+  console.log(JSON.stringify({passed:reports.length,browserErrors:errors,report:reportPath}));
 }
 
 verify().catch(async (error) => {

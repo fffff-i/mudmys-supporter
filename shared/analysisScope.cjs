@@ -17,11 +17,17 @@ function mayIncludeActionText(action) {
 }
 
 function getAnalysisContext(caseRecord, includeRoleProfile) {
-  const allowed = (grounding) => includeRoleProfile === true || !mayIncludeRoleProfile(grounding);
+  const excludedEvidenceIds = new Set((caseRecord.evidence || []).filter((item) => item.analysisEnabled === false).map((item) => item.id));
+  const knownEvidenceOrigin = (grounding) => grounding?.version === INPUT_PROVENANCE_VERSION &&
+    Array.isArray(grounding.evidenceIds) && grounding.evidenceIds.every((id) => typeof id === 'string') && grounding.evidenceOriginUnknown !== true;
+  const allowed = (grounding) => (includeRoleProfile === true || !mayIncludeRoleProfile(grounding)) &&
+    (!excludedEvidenceIds.size || (knownEvidenceOrigin(grounding) && !grounding.evidenceIds.some((id) => excludedEvidenceIds.has(id))));
+  const allowedAction = (action) => allowed(action.grounding) &&
+    (!action.retirementReason || allowed(action.retirementGrounding)) && (!action.resultNote || allowed(action.resultGrounding));
   const previous = caseRecord.analysis;
   const active = (previous?.actions || []).filter((action) => action.status === 'active');
   const actions = active.filter((action) => allowed(action.grounding));
-  const actionHistory = (caseRecord.actionHistory || []).filter((action) => includeRoleProfile === true || !mayIncludeActionText(action));
+  const actionHistory = (caseRecord.actionHistory || []).filter(allowedAction);
   const analysisAllowed = allowed(previous?.grounding);
   const hypotheses = analysisAllowed ? previous?.hypotheses || [] : [];
   const sentHistory = actionHistory;
@@ -34,6 +40,16 @@ function getAnalysisContext(caseRecord, includeRoleProfile) {
     historyActionIds: sentHistory.map((action) => action.id),
     excludedActionIds: active.filter((action) => !allowed(action.grounding)).map((action) => action.id),
     excludedPreviousAnalysis: Boolean(previous && !analysisAllowed),
+    // Carry every input origin forward, even when the displayed reference list is empty.
+    contextEvidenceIds: [...new Set([
+      ...(analysisAllowed ? previous?.grounding?.evidenceIds || [] : []),
+      ...actions.flatMap((action) => action.grounding?.evidenceIds || []),
+      ...sentHistory.flatMap((action) => [action.grounding, action.retirementGrounding, action.resultGrounding].flatMap((origin) => origin?.evidenceIds || []))
+    ])],
+    evidenceOriginUnknown: Boolean((hypotheses.length && !knownEvidenceOrigin(previous?.grounding)) ||
+      actions.some((action) => !knownEvidenceOrigin(action.grounding)) || sentHistory.some((action) =>
+        !knownEvidenceOrigin(action.grounding) || (action.retirementReason && !knownEvidenceOrigin(action.retirementGrounding)) ||
+        (action.resultNote && !knownEvidenceOrigin(action.resultGrounding)))),
     previousContextMayIncludeRoleProfile: Boolean(
       (hypotheses.length && mayIncludeRoleProfile(previous?.grounding)) ||
       actions.some((action) => mayIncludeRoleProfile(action.grounding)) ||

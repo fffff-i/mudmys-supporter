@@ -30,7 +30,7 @@ const methods = {
   listScenarios: 'scenario:list', getScenario: 'scenario:get', getSettings: 'settings:get',
   createScenario: 'scenario:create', createDemo: 'scenario:create-demo', saveProfile: 'scenario:save-profile',
   completeAction: 'scenario:complete-action', discardAction: 'scenario:discard-action', updateActionNotes: 'scenario:action-notes', restoreAction: 'scenario:restore-action',
-  addText: 'scenario:add-text', analyze: 'scenario:analyze', cancelAnalysis: 'scenario:cancel-analysis'
+  addEvidence: 'scenario:add-evidence', analyze: 'scenario:analyze', cancelAnalysis: 'scenario:cancel-analysis'
 };
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function findBrowser() {

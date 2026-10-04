@@ -13,7 +13,7 @@ async function loadDisplay(react = React, window = {}) {
   const ts = require('typescript');
   const appPath = path.resolve(__dirname, '../src/App.tsx');
   const source = await fs.readFile(appPath, 'utf8');
-  const compiled = ts.transpileModule(source + '\nexport { App, EventRow, Citation, SourcePanel, EvidenceCard };', {
+  const compiled = ts.transpileModule(source + '\nexport { App, EventRow, Citation, SourcePanel, EvidenceCard, HistoryPage, sourceName };', {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022, esModuleInterop: true }
   }).outputText;
   const realRequire = createRequire(appPath);
@@ -117,4 +117,33 @@ test('a historical fixed-source citation selects its own snapshot even when the 
   const newer = display.Citation({ scenario: { ...scenario, analysis: snapshots[1] }, id: 'scenario:role-profile', onEvidence: (...args) => calls.push(args) });
   newer.props.onClick();
   assert.equal(calls[1][3], 1);
+});
+
+test('old action and archived-analysis titles stay tied to their snapshots, while material page buttons explicitly open current content', async () => {
+  const display = await loadDisplay();
+  const original = { id: 'pdf', title: 'OLD_TITLE', kind: 'pdf', extractedText: 'ORIGINAL', editedText: 'OLD_EDIT', visibility: 'unknown' };
+  const item = { ...original, title: 'LATEST_TITLE', originalTitle: 'OLD_TITLE', editedText: 'LATEST_EDIT',
+    pdfPages: [{ pageNumber: 1, text: 'ORIGINAL', extractionStatus: 'success' }], pdfPageCount: 1 };
+  const oldAction = { id: 'same-action', title: 'old action', status: 'active', evidenceIds: ['pdf'], sourceSnapshots: [original] };
+  const oldAnalysis = { revision: 1, inputRevision: 1, sources: [original], actions: [oldAction] };
+  const latestAnalysis = { revision: 2, inputRevision: 2, sources: [item], actions: [{ ...oldAction, sourceSnapshots: [item] }] };
+  const scenario = { evidence: [item], analysis: latestAnalysis, analysisHistory: [oldAnalysis], actionHistory: [oldAction] };
+  const calls = [];
+  const citation = display.Citation({ scenario, id: 'pdf', action: oldAction, onEvidence: (...args) => calls.push(args) });
+  assert.match(renderToStaticMarkup(citation), /OLD_TITLE/);
+  assert.doesNotMatch(renderToStaticMarkup(citation), /LATEST_TITLE/);
+  citation.props.onClick(); assert.equal(calls[0][4].actionId, oldAction.id);
+  const history = display.HistoryPage({ scenario, history: [], onRestore() {}, onEvidence: (...args) => calls.push(args) });
+  findElement(history, (node) => node.type === 'button' && node.props.className === 'citation-chip', true).props.onClick();
+  assert.equal(calls[1][3], 0); assert.equal(calls[1][4], undefined);
+  const heading = display.sourceName(scenario, 'pdf', 0);
+  const loading = display.SourcePanel({ view: { loading: true, request: {}, preview: null }, title: heading, onClose() {}, onPage() {} });
+  assert.match(renderToStaticMarkup(loading), /OLD_TITLE/); assert.doesNotMatch(renderToStaticMarkup(loading), /LATEST_TITLE/);
+  const card = display.EvidenceCard({ item, index: 0, selected: false, preview: '', onSelect() {}, onVisibility() {}, onPreview() {},
+    onSource: (...args) => calls.push(args) });
+  findElement(card, (node) => node.type === 'button' && Array.isArray(node.props.children) && node.props.children.join('') === 'p.1').props.onClick();
+  assert.equal(calls[2][1], '1'); assert.equal(calls[2][4].current, true);
+  const legacyAction = { ...oldAction, sourceSnapshots: undefined };
+  const legacyScenario = { ...scenario, analysis: { ...latestAnalysis, actions: [] }, actionHistory: [legacyAction] };
+  assert.match(display.sourceName(legacyScenario, 'pdf', undefined, { actionId: legacyAction.id }), /OLD_TITLE/);
 });

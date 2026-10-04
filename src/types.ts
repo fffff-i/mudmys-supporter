@@ -19,6 +19,9 @@ export type SourcePreview = {
   pageCount: number | null;
   pdfPages: PdfPage[];
   extractionMessage: string;
+  editedText?: string;
+  snapshot?: boolean;
+  snapshotUnavailable?: boolean;
   error?: string;
 };
 
@@ -28,6 +31,11 @@ export type Evidence = {
   originalName?: string;
   kind: 'text' | 'pdf' | 'image';
   extractedText?: string;
+  // The first saved body and attachment stay immutable; edits are a separate input.
+  editedText?: string;
+  originalTitle?: string;
+  updatedAt?: string;
+  analysisEnabled?: boolean;
   attachmentPath?: string;
   extractionStatus?: string;
   extractionMessage?: string;
@@ -51,9 +59,9 @@ export type EventRecord = {
   quote: string;
   ambiguity: string;
   quoteOrigin?: string;
-  quoteSource?: 'text' | 'image';
+  quoteSource?: 'text' | 'image' | 'edited';
   // App-owned; never a model-provided verification claim.
-  quoteVerification?: 'text_matched' | 'image_unverified' | 'legacy_text_matched';
+  quoteVerification?: 'text_matched' | 'image_unverified' | 'legacy_text_matched' | 'edited_text_matched';
 };
 
 export type ActionNotes = { reason: string; resultNote: string };
@@ -73,6 +81,7 @@ export type Action = {
   // Optional for saved results from earlier versions. New analyses store an array.
   assumptions?: string[];
   grounding?: AnalysisGrounding;
+  sourceSnapshots?: AnalysisSource[];
   rechecks?: ActionRecheck[];
   // App-owned provenance for later prose; the original action keeps its own grounding.
   retirementGrounding?: AnalysisGrounding;
@@ -89,7 +98,7 @@ export type Action = {
   restoredAt?: string;
 }
 
-export type AnalysisSource = Pick<Evidence, 'id' | 'title' | 'kind' | 'extractedText' | 'visibility'>;
+export type AnalysisSource = Pick<Evidence, 'id' | 'title' | 'kind' | 'extractedText' | 'visibility'> & Partial<Omit<Evidence, 'id' | 'title' | 'kind' | 'extractedText' | 'visibility'>>;
 
 export type Fact = { statement: string; evidenceIds: [string, ...string[]] };
 export type Hypothesis = { statement: string; why: string; evidenceIds: string[]; assumptions?: string[] };
@@ -100,6 +109,8 @@ export type AnalysisGrounding = {
   includeRoleProfile: boolean;
   previousContextMayIncludeRoleProfile?: boolean;
   evidenceIds: string[];
+  evidenceOriginUnknown?: boolean;
+  inputRevision?: number;
   contextActionIds?: string[];
   contextHistoryActionIds?: string[];
 };
@@ -116,7 +127,7 @@ export type Analysis = {
   hypotheses: Hypothesis[];
   unknowns: { question: string; why: string; evidenceIds: string[] }[];
   actions: Action[];
-  // App-owned snapshots of the fixed sources actually used in this analysis.
+  // App-owned snapshots of the source contents actually used in this analysis.
   sources?: AnalysisSource[];
   grounding?: AnalysisGrounding;
   usage?: { input_tokens?: number; output_tokens?: number } | null;
@@ -198,11 +209,16 @@ declare global {
       deleteScenario: (id: string) => Promise<{ deleted: boolean }>;
       exportScenario: (id: string) => Promise<{ exported: boolean; path?: string }>;
       addText: (value: Record<string, unknown>) => Promise<Scenario>;
+      chooseFiles: (id: string) => Promise<{ canceled?: boolean; files?: { token: string; name: string; kind: Evidence['kind']; byteSize: number; error?: string }[] }>;
+      releaseFiles: (value: { id: string; tokens: string[] }) => Promise<void>;
+      addEvidence: (value: Record<string, unknown>) => Promise<Scenario>;
+      editEvidence: (value: Record<string, unknown>) => Promise<Scenario>;
+      setEvidenceEnabled: (value: { id: string; evidenceId: string; enabled: boolean }) => Promise<Scenario>;
       addFiles: (id: string) => Promise<{ canceled?: boolean; scenario?: Scenario; addedCount?: number }>;
       addPastedImage: (value: Record<string, unknown>) => Promise<Scenario>;
       setVisibility: (value: Record<string, unknown>) => Promise<Scenario>;
       previewImage: (value: Record<string, unknown>) => Promise<string>;
-      readSource: (value: { id: string; evidenceId: string; page?: string; analysisIndex?: number }) => Promise<SourcePreview>;
+      readSource: (value: { id: string; evidenceId: string; page?: string; analysisIndex?: number; actionId?: string; current?: boolean }) => Promise<SourcePreview>;
       completeAction: (value: Record<string, unknown>) => Promise<Scenario>;
       discardAction: (value: Record<string, unknown>) => Promise<Scenario>;
       updateActionNotes: (value: Record<string, unknown>) => Promise<Scenario>;

@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { synopsisText } = require('../shared/analysisSources.cjs');
-const { pdfTextForInput } = require('../shared/pdfSources.cjs');
+const { pdfTextForInput, evidenceTextForInput } = require('../shared/pdfSources.cjs');
 const { renderPageImage, PDF_RENDER_SCALE } = require('./pdfDocuments.cjs');
 
 const MAX_CODEX_IMAGE_BYTES = 40 * 1024 * 1024;
@@ -37,7 +37,7 @@ async function prepareCodexInput(caseRecord, requestData, options = {}) {
     const text = String(value || '');
     textCharacters += text.length;
     if (textCharacters > maxTextCharacters) {
-      throw new Error('Codexへ渡す全文字数がこのアプリの上限' + maxTextCharacters.toLocaleString('ja-JP') + '字を超えています。資料や方針を省略せず解析を停止しました。保存済み原本は保持しています。');
+      throw new Error('Codexへ渡す全文字数がこのアプリの上限' + maxTextCharacters.toLocaleString('ja-JP') + '字を超えています。資料一覧で本文を編集するか資料を解析対象から外すと、同じシナリオで再開できます。保存済み原本は保持しています。');
     }
     input.push({ type: 'text', text });
   };
@@ -54,14 +54,15 @@ async function prepareCodexInput(caseRecord, requestData, options = {}) {
       checkCancelled();
       addText(renderEvidenceLabel(item));
       if (item.kind === 'text') {
-        addText(text || '[テキスト本文は空です]');
+        addText(evidenceTextForInput({ ...item, extractedText: text }));
         continue;
       }
       if (item.kind === 'image') {
         if (!fullPath) throw new Error('画像資料の保存先を確認できません。原本は保持されています。');
         imageBytes += bytes.length;
-        if (imageBytes > maxImageBytes) throw new Error('画像入力がこのアプリの上限40 MiBを超えるため解析を停止しました。資料は切り捨てず、原本を保持しています。');
+        if (imageBytes > maxImageBytes) throw new Error('画像入力がこのアプリの上限40 MiBを超えるため解析を停止しました。資料一覧で画像を解析対象から外すと、同じシナリオで再開できます。原本を保持しています。');
         input.push({ type: 'localImage', path: path.resolve(fullPath) });
+        if (typeof item.editedText === 'string') addText(evidenceTextForInput(item));
         continue;
       }
       if (item.kind !== 'pdf') throw new Error('Codexで扱えない資料形式が含まれています。資料は原本のまま保持しています。');
@@ -72,9 +73,9 @@ async function prepareCodexInput(caseRecord, requestData, options = {}) {
       try {
         pdf = await task.promise;
         if (pageCount + pdf.numPages > maxPdfPages) {
-          throw new Error('このアプリではPDFを全ページ画像化する上限を' + maxPdfPages.toLocaleString('ja-JP') + 'ページにしています。ページを省かず解析を停止しました。PDF原本は保持しています。');
+          throw new Error('このアプリではPDFを全ページ画像化する上限を' + maxPdfPages.toLocaleString('ja-JP') + 'ページにしています。資料一覧でPDFを解析対象から外すと、同じシナリオで再開できます。PDF原本は保持しています。');
         }
-        addText((text
+        addText(typeof item.editedText === 'string' ? pdfTextForInput(item, true) : (text
           ? '[PDFからローカル抽出した全文です。PDFの全ページ画像も続けて添付します。]\n'
           : '[PDFから文字を抽出できませんでした。以下の全ページ画像を読み取り、画像由来の引用は引用未照合として扱ってください。]\n') +
           (item.pdfPages ? pdfTextForInput(item, true) : text || ''));
@@ -88,7 +89,7 @@ async function prepareCodexInput(caseRecord, requestData, options = {}) {
           finally { try { page.cleanup(); } catch { /* release page resources */ } }
           imageBytes += png.length;
           if (imageBytes > maxImageBytes) {
-            throw new Error('画像資料とPDF全ページ画像の合計がこのアプリの画像入力上限40 MiBを超えました。ページを省かず解析を停止し、原本は保持しています。');
+            throw new Error('画像資料とPDF全ページ画像の合計がこのアプリの画像入力上限40 MiBを超えました。資料一覧で画像やPDFを解析対象から外すと、同じシナリオで再開できます。原本は保持しています。');
           }
           const pagePath = path.join(temporaryDirectory, item.id + '-page-' + String(number).padStart(4, '0') + '.png');
           await fs.writeFile(pagePath, png, { flag: 'wx' });

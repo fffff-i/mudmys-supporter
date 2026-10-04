@@ -1,4 +1,5 @@
 const { getAnalysisContext } = require('./analysisScope.cjs');
+const { enabledEvidence } = require('./evidence.mjs');
 const SYNOPSIS_SOURCE_ID = 'scenario:synopsis';
 const ROLE_PROFILE_SOURCE_ID = 'scenario:role-profile';
 
@@ -24,7 +25,7 @@ function getFixedAnalysisSources(caseRecord, options = {}) {
 
 function getAnalysisSources(caseRecord, options = {}) {
   const sentIds = Array.isArray(options.evidenceIds) ? new Set(options.evidenceIds) : null;
-  const evidence = (caseRecord.evidence || []).filter((item) =>
+  const evidence = enabledEvidence(caseRecord).filter((item) =>
     item.id !== SYNOPSIS_SOURCE_ID && item.id !== ROLE_PROFILE_SOURCE_ID &&
     (!sentIds || sentIds.has(item.id)));
   return [...evidence, ...getFixedAnalysisSources(caseRecord, options)];

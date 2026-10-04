@@ -214,6 +214,20 @@ button:disabled { cursor: default; opacity: .62; }
 
 .evidence-layout { display: grid; grid-template-columns: minmax(350px, .86fr) minmax(450px, 1.14fr); gap: 17px; align-items: start; }
 .evidence-input-column { display: grid; gap: 13px; }
+.intake-options, .evidence-edit { margin: 12px 0; color: #617368; font-size: 11px; }
+.intake-options summary, .evidence-edit summary { cursor: pointer; line-height: 1.7; }
+.intake-options summary span, .evidence-edit summary span { margin-left: 8px; color: #8c988e; font-size: 10px; }
+.add-note-panel .drop-zone { min-height: 80px; }
+.intake-candidates { list-style: none; margin: 12px 0; padding: 0; display: grid; gap: 8px; }
+.intake-candidates li { display: flex; align-items: center; gap: 8px; padding: 9px; border: 1px solid #e0e5dc; border-radius: 4px; }
+.intake-candidates img { width: 48px; height: 40px; object-fit: contain; }
+.intake-candidates li > div { flex: 1; min-width: 0; overflow-wrap: anywhere; display: grid; gap: 4px; }
+.intake-candidates strong { font-size: 11px; }
+.intake-candidates small { color: #7d8d80; }
+.intake-candidates [role=alert] { color: #a24a3e; font-size: 11px; }
+.intake-candidates button { border: 0; background: transparent; color: #647568; cursor: pointer; font-size: 20px; }
+.source-snapshot-note { padding: 8px 10px; background: #f5f1e5; color: #736444; font-size: 11px; line-height: 1.7; }
+.evidence-enabled { margin-bottom: 8px; }
 .evidence-list-column { min-width: 0; }
 .add-note-panel, .import-panel, .profile-panel { padding: 17px 17px 15px; }
 .step-pill { border: 1px solid #e7e3d7; border-radius: 14px; padding: 4px 7px; color: #a58c58; background: #faf8f0; font-size: 8px; }
