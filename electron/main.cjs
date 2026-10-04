@@ -5,9 +5,10 @@ const os = require('node:os');
 const { execFileSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const OpenAI = require('openai').default;
-const { applyAnalysis, discardAction, restoreAction } = require('../shared/analysisLifecycle.cjs');
+const { applyAnalysis, completeAction, discardAction, updateActionNotes, restoreAction } = require('../shared/analysisLifecycle.cjs');
 const { SYNOPSIS_SOURCE_ID, ROLE_PROFILE_SOURCE_ID, synopsisText, roleText, unconfirmedAssumptionsText } = require('../shared/analysisSources.cjs');
 const { getAnalysisContext } = require('../shared/analysisScope.cjs');
+const { actionContextText } = require('../shared/actionHistory.cjs');
 const { getCaseDir } = require('../shared/storage.cjs');
 const { createSerialLock } = require('../shared/serialLock.cjs');
 const { CodexAppServerClient, CodexAppServerError, buildCodexEnvironment } = require('./codexAppServer.cjs');
@@ -46,7 +47,7 @@ const ANALYSIS_SCHEMA = {
     facts: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'evidenceIds'], properties: { statement: { type: 'string' }, evidenceIds: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 }, description: '今回送信された実在する出典。事実は出典を1件以上必要とする。' } } } },
     hypotheses: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'why', 'evidenceIds', 'assumptions'], properties: { statement: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '想定した未公開情報など、未確認の条件。条件がなければ空配列。' } } } },
     unknowns: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['question', 'why', 'evidenceIds'], properties: { question: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
-    actions: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['title', 'who', 'step', 'suggestedLine', 'purpose', 'secretRisk', 'rationale', 'priority', 'evidenceIds', 'assumptions', 'continuesActionIds', 'replacesActionIds'], properties: { title: { type: 'string' }, who: { type: 'string' }, step: { type: 'string' }, suggestedLine: { type: 'string' }, purpose: { type: 'string' }, secretRisk: { type: 'string' }, rationale: { type: 'string' }, priority: { type: 'integer' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '行動が依存する未確認の条件。単なる確認行動には条件を作らず空配列にする。' }, continuesActionIds: { type: 'array', items: { type: 'string' } }, replacesActionIds: { type: 'array', items: { type: 'string' } } } } },
+    actions: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['title', 'who', 'step', 'suggestedLine', 'purpose', 'secretRisk', 'rationale', 'priority', 'evidenceIds', 'assumptions', 'continuesActionIds', 'replacesActionIds', 'rechecks'], properties: { title: { type: 'string' }, who: { type: 'string' }, step: { type: 'string' }, suggestedLine: { type: 'string' }, purpose: { type: 'string' }, secretRisk: { type: 'string' }, rationale: { type: 'string' }, priority: { type: 'integer' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '行動が依存する未確認の条件。単なる確認行動には条件を作らず空配列にする。' }, continuesActionIds: { type: 'array', items: { type: 'string' } }, replacesActionIds: { type: 'array', items: { type: 'string' } }, rechecks: { type: 'array', description: '完了・見送りを新しい前提で再確認する場合だけ、元履歴IDと具体的な前提の違いを示す。通常は空配列。', items: { type: 'object', additionalProperties: false, required: ['actionId', 'previousPremise', 'currentPremise', 'reason'], properties: { actionId: { type: 'string', minLength: 1 }, previousPremise: { type: 'string', minLength: 1 }, currentPremise: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } } } } } } },
     retirements: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['actionId', 'reason'], properties: { actionId: { type: 'string' }, reason: { type: 'string' } } } }
   }
 };
@@ -64,7 +65,10 @@ const SYSTEM_PROMPT = [
   '事実のevidenceIdsには今回送信された実在する出典IDを1件以上必ず入れます。仮説・行動のevidenceIdsは任意で、根拠がなければ空配列にします。参照するIDは資料IDを一字一句そのまま使い、推測しません。概要・役プロフィールは資料IDが付いて送信された場合だけその固定出典IDを使えます。未入力・送信対象外のプロフィールは参照できません。',
   '仮説・行動で未公開情報の存在を想定する場合、assumptionsに未確認の条件を短く記録し、本文も「別の出入口があるなら」のように条件付きにします。条件がなければ空配列にし、単なる確認行動に前提を無理に付けません。利用者に分類・根拠登録・前提の手入力や確認操作を求めません。',
   '次回更新でも前回の仮説・行動のassumptionsは未確認の条件です。新資料に直接の裏付けがあるか見直し、確認されない条件は保持します。事実へ移すには、その条件を直接裏付ける今回の実在する出典が必要です。以前のAI出力や提案の繰り返し、関連資料のIDが付いているだけでは裏付けになりません。資料にないシナリオの正解を事実として補完しません。',
-  '現在の有効方針のIDはローカルアプリが管理します。継続する方針は continuesActionIds、新しい案に置き換える方針は replacesActionIds に置き、不要な方針は retirements に理由を付けます。各既存方針IDはこのいずれかにちょうど1回だけ含めてください。手動で棄却された方針は再提案しません。',
+  '現在の有効方針のIDはローカルアプリが管理します。継続する方針は continuesActionIds、新しい案に置き換える方針は replacesActionIds に置き、不要な方針は retirements に理由を付けます。各既存方針IDはこのいずれかにちょうど1回だけ含めてください。完了・見送りの履歴は通常の再提案をしません。',
+  '履歴のid・相手(who)・目的(purpose)・手順(step/suggestedLine)・未確認の前提(assumptions)・日時・任意の理由/回答を参照し、見出しを言い換えた同じ確認行動も完了・見送りとして扱います。履歴の理由や回答メモ自体は事実の出典ではありません。回答未入力や理由未入力で確認操作を求めず、入力されている理由も尊重します。',
+  '新しい前提により完了・見送りの行動を再確認する場合だけrechecksを付けます。actionIdは今回送られた元履歴ID、previousPremiseは元の前提・理由・手順にある短い原文、currentPremiseは今回の具体的な変化、reasonは再確認が必要な理由です。単なる見出しの変更・言い換え・関連資料IDの追加を前提の変化にしません。新しい前提が未確認ならassumptionsにも条件として示します。根拠資料は任意です。継続・置換した再確認の説明は保持します。通常の行動のrechecksは空配列です。',
+  '根拠資料の公開範囲と提案文の秘密漏洩リスクは別です。公開資料が根拠でも安全に発言できるとは扱わず、secretRiskには発言前に守る秘密や注意を短く示します。根拠のない確認行動を全体公開と推定しません。',
   '出力は指定JSONスキーマに従ってください。',
 ].join('\n');
 
@@ -370,10 +374,7 @@ async function evidenceForRequest(caseRecord, includeRoleProfile, provider) {
 }
 
 function currentActionsText(caseRecord, includeRoleProfile) {
-  const context = getAnalysisContext(caseRecord, includeRoleProfile).caseRecord;
-  const current = context.analysis.actions;
-  const rejected = context.actionHistory.filter((action) => action.status === 'discarded');
-  return '\n\n[アプリが保持する現在の方針状態。資料としての根拠ではありません]\n有効方針: ' + JSON.stringify(current.map((a) => ({ id: a.id, title: a.title, step: a.step, priority: a.priority }))) + '\n手動棄却済み(再提案しない): ' + JSON.stringify(rejected.map((a) => ({ title: a.title }))) + '\n';
+  return actionContextText(caseRecord, includeRoleProfile);
 }
 
 function renderEvidenceLabel(item) {
@@ -855,14 +856,12 @@ ipcMain.handle('scenario:read-source', async (_event, payload) => {
     return { ...result, error: message };
   }
 });
-ipcMain.handle('scenario:complete-action', async (_event, payload) => mutateCase(payload.id, (current) => {
-  const actions = current.analysis && current.analysis.actions || [];
-  const selected = actions.find((action) => action.id === payload.actionId && action.status === 'active');
-  if (!selected) throw new Error('有効な方針を選んでください。');
-  const now = new Date().toISOString();
-  return { ...current, revision: current.revision + 1, updatedAt: now, analysis: { ...current.analysis, actions: actions.filter((action) => action.id !== payload.actionId) }, actionHistory: [...(current.actionHistory || []), { ...selected, status: 'completed', retiredAt: now, retirementReason: '対応済み', replacedByActionId: null }] };
-}));
-ipcMain.handle('scenario:discard-action', async (_event, payload) => mutateCase(payload.id, (current) => discardAction(current, payload.actionId, payload.reason)));
+ipcMain.handle('scenario:complete-action', async (_event, payload) => mutateCase(payload.id, async (current) =>
+  completeAction(current, payload.actionId, new Date().toISOString(), await readPreferences())));
+ipcMain.handle('scenario:discard-action', async (_event, payload) => mutateCase(payload.id, async (current) =>
+  discardAction(current, payload.actionId, payload.reason, new Date().toISOString(), await readPreferences())));
+ipcMain.handle('scenario:action-notes', async (_event, payload) => mutateCase(payload.id, async (current) =>
+  updateActionNotes(current, payload.actionId, { reason: payload.reason, resultNote: payload.resultNote }, new Date().toISOString(), await readPreferences())));
 ipcMain.handle('scenario:restore-action', async (_event, payload) => mutateCase(payload.id, (current) => restoreAction(current, payload.actionId)));
 ipcMain.handle('scenario:analyze', async (_event, payload) => analyzeCase(payload.id, payload.expectedRevision));
 ipcMain.handle('scenario:cancel-analysis', async (_event, payload) => {

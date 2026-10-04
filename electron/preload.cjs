@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('makua', {
   readSource: (value) => ipcRenderer.invoke('scenario:read-source', value),
   completeAction: (value) => ipcRenderer.invoke('scenario:complete-action', value),
   discardAction: (value) => ipcRenderer.invoke('scenario:discard-action', value),
+  updateActionNotes: (value) => ipcRenderer.invoke('scenario:action-notes', value),
   restoreAction: (value) => ipcRenderer.invoke('scenario:restore-action', value),
   analyze: (value) => ipcRenderer.invoke('scenario:analyze', value),
   cancelAnalysis: (value) => ipcRenderer.invoke('scenario:cancel-analysis', value)

@@ -56,6 +56,9 @@ export type EventRecord = {
   quoteVerification?: 'text_matched' | 'image_unverified' | 'legacy_text_matched';
 };
 
+export type ActionNotes = { reason: string; resultNote: string };
+export type ActionRecheck = { actionId: string; previousPremise: string; currentPremise: string; reason: string };
+
 export type Action = {
   id: string;
   title: string;
@@ -70,6 +73,12 @@ export type Action = {
   // Optional for saved results from earlier versions. New analyses store an array.
   assumptions?: string[];
   grounding?: AnalysisGrounding;
+  rechecks?: ActionRecheck[];
+  // App-owned provenance for later prose; the original action keeps its own grounding.
+  retirementGrounding?: AnalysisGrounding;
+  resultNote?: string;
+  resultGrounding?: AnalysisGrounding;
+  notesUpdatedAt?: string;
   status: string;
   createdAt: string;
   updatedAt?: string;
@@ -196,6 +205,7 @@ declare global {
       readSource: (value: { id: string; evidenceId: string; page?: string; analysisIndex?: number }) => Promise<SourcePreview>;
       completeAction: (value: Record<string, unknown>) => Promise<Scenario>;
       discardAction: (value: Record<string, unknown>) => Promise<Scenario>;
+      updateActionNotes: (value: Record<string, unknown>) => Promise<Scenario>;
       restoreAction: (value: Record<string, unknown>) => Promise<Scenario>;
       analyze: (value: Record<string, unknown>) => Promise<{ status: string; message?: string; scenario?: Scenario; usage?: Analysis['usage']; textCharacters?: number; attachmentBytes?: number }>;
       cancelAnalysis: (value: Record<string, unknown>) => Promise<{ canceled: boolean }>;

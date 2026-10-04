@@ -52,6 +52,11 @@ async function loadMain(t) {
   await fs.writeFile(path.join(directory, 'openai-key.bin'), 'synthetic-test-key');
   const requests = [];
   let nextOutput;
+  let responseGate;
+  const captureRequest = async (provider, request) => {
+    requests.push({ provider, request });
+    if (responseGate) await responseGate.wait;
+  };
   const handlers = new Map();
   const preventUi = () => { throw new Error('GUI must not be opened by grounding tests'); };
   const electron = {
@@ -65,7 +70,7 @@ async function loadMain(t) {
   class FakeOpenAI {
     constructor() {
       this.responses = { create: async (request) => {
-        requests.push({ provider: 'openai', request });
+        await captureRequest('openai', request);
         return { output_text: JSON.stringify(nextOutput), usage: null };
       } };
     }
@@ -77,7 +82,7 @@ async function loadMain(t) {
       throw new Error('Unexpected mock Codex method: ' + method);
     },
     runStructuredTurn: async (request) => {
-      requests.push({ provider: 'codex', request });
+      await captureRequest('codex', request);
       return { text: JSON.stringify(nextOutput) };
     }
   };
@@ -88,7 +93,7 @@ async function loadMain(t) {
     module: { exports: {} }, __dirname: path.dirname(mainPath), process, Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout, fakeCodex,
     fetch: async (url, options) => {
       assert.equal(url, 'http://localhost:11434/api/chat');
-      requests.push({ provider: 'ollama', request: JSON.parse(options.body) });
+      await captureRequest('ollama', JSON.parse(options.body));
       return { ok: true, json: async () => ({ message: { content: JSON.stringify(nextOutput) } }) };
     }
   };
@@ -97,6 +102,12 @@ async function loadMain(t) {
   return {
     ...context.module.exports, directory, requests, handlers,
     setOutput(value) { nextOutput = value; },
+    holdResponse() {
+      let release;
+      responseGate = { wait: new Promise((resolve) => { release = resolve; }) };
+      t.after(() => release());
+      return { release };
+    },
     async store(scenario, preferences) {
       const caseDirectory = path.join(directory, 'cases', scenario.id);
       await fs.mkdir(caseDirectory, { recursive: true });
@@ -198,7 +209,7 @@ async function loadDisplay() {
   const ts = require('typescript');
   const appPath = path.join(root, 'src/App.tsx');
   const code = await fs.readFile(appPath, 'utf8');
-  const compiled = ts.transpileModule(code + '\nexport { Assumptions, Citations, SignalPanel, PlansPage, Overview, EvidencePage, HistoryPage, SettingsPage };', {
+  const compiled = ts.transpileModule(code + '\nexport { Assumptions, Citations, SignalPanel, PlansPage, Overview, EvidencePage, HistoryPage, SettingsPage, ActionControls, ActionCare, ActionSourceScope, RecheckNotes, HistoryNoteEditor };', {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022, esModuleInterop: true }
   }).outputText;
   const realRequire = createRequire(appPath);
@@ -221,7 +232,7 @@ test('headless rendering shows only actual assumptions and opens saved fixed-sou
   assert.match(hypothesisHtml, /仮定（未確認）/);
   assert.match(hypothesisHtml, /別の出入口が存在する/);
   assert.doesNotMatch(hypothesisHtml, /資料根拠なし|citation-missing/);
-  const props = { scenario, settings: { provider: 'none', textLimitCharacters: 300000 }, onEvidence: noop, onAnalyze: noop, onComplete: noop, onDiscardStart: noop, onDiscard: noop, setDiscardReason: noop, onDiscardCancel: noop, discardId: '', discardReason: '' };
+  const props = { scenario, settings: { provider: 'none', textLimitCharacters: 300000 }, onEvidence: noop, onAnalyze: noop, onComplete: noop, onDiscard: noop };
   const planHtml = render(display.PlansPage, { ...props, actions: scenario.analysis.actions });
   assert.match(planHtml, /仮定（未確認）/);
   assert.match(planHtml, /別の出入口が存在する/);
@@ -392,3 +403,144 @@ test('headless local history keeps protected results and fixed-source snapshots 
   assert.match(settings, /由来不明の過去の方針・仮説・履歴等も送信しません/);
   assert.match(settings, /同じ役情報がHOに含まれる場合は、HOを含む資料の送信設定に従います/);
 });
+
+for (const provider of ['openai', 'ollama', 'codex']) {
+  test(provider + ' single-click completion/dismissal and optional IPC notes are included in the next scoped history input', async (t) => {
+    const harness = await loadMain(t);
+    const { scenario, sourceId } = fixture();
+    const first = scenario.analysis.actions[0];
+    const second = { ...first, id: randomUUID(), title: '記録の意味を保管係に確認する', who: '保管係', purpose: '記録の意味を知る', step: '保管係へ日時欄と記号の意味を聞く', assumptions: ['記録が返却を意味する'] };
+    scenario.analysis.actions.push(second);
+    const preferences = { provider, cloudConsent: true, codexConsent: true, includeRoleProfile: false, ollamaModel: 'synthetic-model' };
+    await harness.store(scenario, preferences);
+    const completed = await harness.handlers.get('scenario:complete-action')({}, { id: scenario.id, actionId: first.id });
+    assert.equal(completed.actionHistory[0].status, 'completed');
+    assert.equal(completed.actionHistory[0].retirementReason, '');
+    const discarded = await harness.handlers.get('scenario:discard-action')({}, { id: scenario.id, actionId: second.id });
+    assert.equal(discarded.actionHistory[1].status, 'discarded');
+    assert.equal(discarded.actionHistory[1].retirementReason, '');
+    assert.equal(harness.requests.length, 0, 'state changes do not require an AI request');
+    const done = await harness.handlers.get('scenario:action-notes')({}, { id: scenario.id, actionId: second.id, reason: 'SAFE_OPTIONAL_REASON_MARKER', resultNote: 'SAFE_OPTIONAL_ANSWER_MARKER' });
+    const next = outputFor(sourceId); next.actions = []; next.hypotheses = [];
+    harness.setOutput(next);
+    const result = await harness.analyzeCase(scenario.id, done.revision);
+    assert.equal(result.status, 'ok', result.message);
+    const text = JSON.stringify(harness.requests.at(-1).request);
+    for (const old of done.actionHistory) {
+      for (const value of [old.id, old.status, old.who, old.purpose, old.step, old.retiredAt, ...old.assumptions]) assert.ok(text.includes(value), value);
+    }
+    for (const value of ['SAFE_OPTIONAL_REASON_MARKER', 'SAFE_OPTIONAL_ANSWER_MARKER']) assert.ok(text.includes(value));
+    assert.ok(!text.includes('PROFILE_SECRET_MARKER'));
+    assert.deepEqual(Array.from(result.scenario.analysis.grounding.contextHistoryActionIds), [first.id, second.id]);
+    assert.equal(result.scenario.evidence.length, scenario.evidence.length, 'a history note is not promoted into a source');
+    const schema = harness.ANALYSIS_SCHEMA.properties.actions.items;
+    assert.ok(schema.required.includes('rechecks'));
+    assert.deepEqual(Array.from(schema.properties.rechecks.items.required), ['actionId', 'previousPremise', 'currentPremise', 'reason']);
+  });
+
+  test(provider + ' OFF never resends ON-generated retirement reasons or manual notes attached to an OFF-origin action', async (t) => {
+    const harness = await loadMain(t);
+    for (const status of ['retired', 'completed', 'discarded']) {
+      const { scenario, sourceId } = fixture();
+      const original = scenario.analysis.actions[0];
+      const preferences = { provider, cloudConsent: true, codexConsent: true, includeRoleProfile: true, ollamaModel: 'synthetic-model' };
+      await harness.store(scenario, preferences);
+      let saved;
+      if (status === 'retired') {
+        const next = outputFor(sourceId); next.actions = []; next.hypotheses = [];
+        next.retirements = [{ actionId: original.id, reason: 'ON_RETIREMENT_REASON_SECRET_MARKER' }];
+        harness.setOutput(next);
+        const result = await harness.analyzeCase(scenario.id, scenario.revision);
+        assert.equal(result.status, 'ok', result.message);
+        saved = result.scenario;
+        assert.equal(saved.actionHistory[0].retirementGrounding.includeRoleProfile, true);
+      } else {
+        saved = await harness.handlers.get(status === 'completed' ? 'scenario:complete-action' : 'scenario:discard-action')({}, { id: scenario.id, actionId: original.id });
+        saved = await harness.handlers.get('scenario:action-notes')({}, { id: scenario.id, actionId: original.id, reason: 'ON_MANUAL_REASON_SECRET_MARKER', resultNote: 'ON_RESPONSE_SECRET_MARKER' });
+        assert.equal(saved.actionHistory[0].retirementGrounding.includeRoleProfile, true);
+        assert.equal(saved.actionHistory[0].resultGrounding.includeRoleProfile, true);
+      }
+      assert.equal(saved.actionHistory[0].grounding.includeRoleProfile, false);
+      await harness.store(saved, { ...preferences, includeRoleProfile: false });
+      const offOutput = outputFor(sourceId); offOutput.actions = []; offOutput.hypotheses = [];
+      harness.setOutput(offOutput);
+      const off = await harness.analyzeCase(saved.id, saved.revision);
+      assert.equal(off.status, 'ok', off.message);
+      const text = JSON.stringify(harness.requests.at(-1).request);
+      for (const marker of ['PROFILE_SECRET_MARKER', 'ON_RETIREMENT_REASON_SECRET_MARKER', 'ON_MANUAL_REASON_SECRET_MARKER', 'ON_RESPONSE_SECRET_MARKER', original.id]) assert.ok(!text.includes(marker), marker);
+      assert.deepEqual(Array.from(off.scenario.analysis.grounding.contextHistoryActionIds), []);
+      assert.equal(off.scenario.actionHistory[0].retirementReason, saved.actionHistory[0].retirementReason);
+      assert.equal(off.scenario.actionHistory[0].status, status);
+      assert.equal(off.scenario.analysis.grounding.previousContextMayIncludeRoleProfile, false);
+    }
+  });
+}
+
+test('action cards distinguish source scope, show care and premise changes outside details, and permit optional-only history forms', async () => {
+  const React = require('react');
+  const { renderToStaticMarkup } = require('react-dom/server');
+  const display = await loadDisplay();
+  const render = (component, props) => renderToStaticMarkup(React.createElement(component, props));
+  const { scenario, sourceId } = fixture();
+  const action = { ...scenario.analysis.actions[0], evidenceIds: [sourceId], secretRisk: 'PRIVATE_SPEECH_RISK_MARKER',
+    rechecks: [{ actionId: 'old-action', previousPremise: '証人は退場済み', currentPremise: '証人が戻った可能性', reason: '在席しているなら聞き直せる' }] };
+  scenario.evidence[0].visibility = 'shared';
+  const noop = () => {};
+  const props = { scenario, actions: [action], settings: { provider: 'none' }, onAnalyze: noop, onComplete: noop, onDiscard: noop, onEvidence: noop };
+  const html = render(display.PlansPage, props);
+  assert.match(html, /根拠資料の公開範囲/);
+  assert.match(html, /全体公開/);
+  assert.ok(html.indexOf('PRIVATE_SPEECH_RISK_MARKER') < html.indexOf('<details'));
+  assert.ok(html.indexOf('証人が戻った可能性') < html.indexOf('<details'));
+  assert.match(html, /以前: 証人は退場済み/);
+  assert.doesNotMatch(html, /discard-box|理由を保存して棄却/);
+  const withoutSources = render(display.ActionSourceScope, { scenario, action: { ...action, evidenceIds: [] } });
+  assert.match(withoutSources, /参照資料なし/);
+  assert.doesNotMatch(withoutSources, /全体公開/);
+  const missing = render(display.ActionSourceScope, { scenario, action: { ...action, evidenceIds: [sourceId, 'missing'] } });
+  assert.match(missing, /公開状況不明/);
+  assert.doesNotMatch(missing, /全体公開/);
+  scenario.evidence[0].visibility = 'private';
+  assert.match(render(display.ActionSourceScope, { scenario, action }), /自分だけ/);
+  assert.match(render(display.ActionCare, { action: { ...action, secretRisk: '' } }), /未確認/);
+  const overview = render(display.Overview, { ...props, activeActions: [action], onEdit: noop, onPlans: noop });
+  assert.match(overview, /PRIVATE_SPEECH_RISK_MARKER/);
+  assert.match(overview, /見送る/);
+  const calls = [];
+  const controls = display.ActionControls({ action, onComplete: (value) => calls.push(['completed', value.id]), onDiscard: (value) => calls.push(['discarded', value.id]) });
+  controls.props.children[0].props.onClick();
+  controls.props.children[1].props.onClick();
+  assert.deepEqual(calls, [['completed', action.id], ['discarded', action.id]]);
+  const pending = display.ActionControls({ action, onComplete: noop, onDiscard: noop, pending: true });
+  assert.ok(pending.props.children.every((button) => button.props.disabled));
+  let saved; let prevented = false;
+  const editor = display.HistoryNoteEditor({ action: { ...action, status: 'discarded' }, notes: { reason: '', resultNote: '' }, onChange: noop, onSave: (value) => { saved = value; } });
+  editor.props.children[1].props.onSubmit({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.deepEqual({ ...saved }, { reason: '', resultNote: '' });
+  const editorHtml = render(display.HistoryNoteEditor, { action, notes: { reason: '', resultNote: '' }, onChange: noop, onSave: noop });
+  assert.doesNotMatch(editorHtml, /required|disabled/);
+});
+
+for (const provider of ['openai', 'ollama', 'codex']) {
+  test(provider + ' a completion during analysis preserves the recorded history and rejects the older result', async (t) => {
+    const harness = await loadMain(t);
+    const { scenario, sourceId } = fixture();
+    await harness.store(scenario, { provider, cloudConsent: true, codexConsent: true, includeRoleProfile: false, ollamaModel: 'synthetic-model' });
+    const next = outputFor(sourceId); next.actions[0].continuesActionIds = [scenario.analysis.actions[0].id];
+    harness.setOutput(next);
+    const gate = harness.holdResponse();
+    const running = harness.analyzeCase(scenario.id, scenario.revision);
+    try {
+      for (let attempt = 0; attempt < 200 && harness.requests.length === 0; attempt += 1) await delay(5);
+      assert.equal(harness.requests.length, 1);
+      const completed = await harness.handlers.get('scenario:complete-action')({}, { id: scenario.id, actionId: scenario.analysis.actions[0].id });
+      assert.equal(completed.actionHistory[0].status, 'completed');
+      gate.release();
+      const result = await running;
+      assert.equal(result.status, 'stale');
+      assert.deepEqual(await harness.read(scenario), JSON.parse(JSON.stringify(completed)));
+      assert.equal((await harness.read(scenario)).analysis.actions.length, 0);
+    } finally { gate.release(); await running; }
+  });
+}

@@ -7,7 +7,7 @@ function fixture() {
   return {
     id: 'case-a', revision: 4, updatedAt: '2026-09-27T00:00:00.000Z',
     evidence: [{ id: 'ev-1', title: '温室のメモ' }],
-    analysis: { grounding: { version: 1, includeRoleProfile: false, previousContextMayIncludeRoleProfile: false, evidenceIds: ['ev-1'] }, actions: [{ id: 'act-1', title: '時刻を照合する', status: 'active', createdAt: '2026-09-26T00:00:00.000Z', grounding: { version: 1, includeRoleProfile: false, previousContextMayIncludeRoleProfile: false, evidenceIds: ['ev-1'] } }] },
+    analysis: { grounding: { version: 1, includeRoleProfile: false, previousContextMayIncludeRoleProfile: false, evidenceIds: ['ev-1'] }, actions: [{ id: 'act-1', title: '時刻を照合する', who: '二人', purpose: '停電の時刻ずれを確かめる', step: '二人へ停電の時刻を確認する。', suggestedLine: '停電は何時でしたか。', status: 'active', createdAt: '2026-09-26T00:00:00.000Z', grounding: { version: 1, includeRoleProfile: false, previousContextMayIncludeRoleProfile: false, evidenceIds: ['ev-1'] } }] },
     actionHistory: []
   };
 }
@@ -48,12 +48,12 @@ test('requires a disposition for every active action and a reason for retirement
 test('a dismissed action cannot silently return after later analysis', () => {
   const dismissed = discardAction(fixture(), 'act-1', '相手の証言と矛盾し、現状では意味がない。', '2026-09-27T01:00:00.000Z');
   const later = { ...dismissed, revision: 5, evidence: [...dismissed.evidence, { id: 'ev-2', title: '新しい証言' }] };
-  const revived = response({ actions: [{ title: '時刻を照合する', step: '二人に再度聞く。', rationale: '時刻の一致を見る。', priority: 1, evidenceIds: ['ev-1'], continuesActionIds: [], replacesActionIds: [] }], retirements: [] });
+  const revived = response({ actions: [{ title: '時刻を照合する', who: '二人', purpose: '停電の時刻ずれを確かめる', suggestedLine: '停電は何時でしたか。', step: '二人に再度聞く。', rationale: '時刻の一致を見る。', priority: 1, evidenceIds: ['ev-1'], continuesActionIds: [], replacesActionIds: [] }], retirements: [] });
   assert.throws(() => applyAnalysis(later, revived, 5), /手動で棄却/);
   assert.equal(dismissed.actionHistory[0].status, 'discarded');
 });
 
-test('a dismissed action returns only after an explicit restore operation', () => {
+test('an explicit restore creates a linked action and keeps the dismissal history', () => {
   const dismissed = discardAction(fixture(), 'act-1', 'ひとまず保留にする。', '2026-09-27T01:00:00.000Z');
   const restored = restoreAction(dismissed, 'act-1', '2026-09-27T02:00:00.000Z');
   assert.equal(restored.analysis.actions.at(-1).restoredFromId, 'act-1');

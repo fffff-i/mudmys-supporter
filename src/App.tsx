@@ -2,7 +2,7 @@ import { FormEvent, ClipboardEvent, useEffect, useMemo, useRef, useState } from 
 import { createSelectionGuard } from '../shared/selectionGuard.mjs';
 import { createScenarioDrafts, type ProfileDraft, type TextDraft } from '../shared/scenarioDrafts.mjs';
 import { createSourceReader, type SourceViewState } from '../shared/sourceReader.mjs';
-import type { Action, AppSettings, CodexConnectionStatus, EventRecord, Evidence, Scenario, Visibility } from './types';
+import type { Action, ActionNotes, AppSettings, CodexConnectionStatus, EventRecord, Evidence, Scenario, Visibility } from './types';
 
 type Page = 'overview' | 'evidence' | 'plans' | 'history' | 'settings';
 type OpenSource = (id: string, page?: string, verification?: string, analysisIndex?: number) => void;
@@ -76,8 +76,10 @@ function App() {
   const [preview, setPreview] = useState('');
   const [sourceView, setSourceView] = useState<SourceViewState | null>(null);
   const sourceReader = useRef(createSourceReader((request) => window.makua.readSource(request), setSourceView));
-  const [discardId, setDiscardId] = useState('');
-  const [discardReason, setDiscardReason] = useState('');
+  const actionWrites = useRef(new Set<string>());
+  const [pendingActionKeys, setPendingActionKeys] = useState<string[]>([]);
+  const [noteDrafts, setNoteDrafts] = useState<Record<string, ActionNotes>>({});
+  const pendingActionIds = scenario ? pendingActionKeys.filter((key) => key.startsWith(scenario.id + '/')).map((key) => key.slice(scenario.id.length + 1)) : [];
   const [, setDraftVersion] = useState(0);
   const draft = scenario && !deletedScenarioIds.current.has(scenario.id) ? scenarioDrafts.current.read(scenario) : null;
   const refreshDrafts = () => setDraftVersion((current) => current + 1);
@@ -246,8 +248,6 @@ function App() {
     else { displayedScenario.current = null; setScenario(null); }
     setPage('overview');
     setSelectedEvidence('');
-    setDiscardId('');
-    setDiscardReason('');
     setNotice('');
     setError('');
     try {
@@ -379,34 +379,63 @@ function App() {
     } catch (reason) { reportError(reason, token); }
   };
 
+  const changeAction = async (action: Action, save: () => Promise<Scenario>, message: string) => {
+    const token = selectionGuard.current.capture();
+    if (!scenario || token.id !== scenario.id || deletedScenarioIds.current.has(scenario.id)) return null;
+    const key = scenario.id + '/' + action.id;
+    if (actionWrites.current.has(key)) return null;
+    actionWrites.current.add(key);
+    setPendingActionKeys([...actionWrites.current]);
+    try {
+      const saved = await save();
+      if (selectionGuard.current.isCurrent(token)) await updateScenario(saved, message, false, token);
+      else {
+        mergeScenario(saved);
+        const currentToken = selectionGuard.current.capture();
+        if (currentToken.id === saved.id) {
+          const fresh = await window.makua.getScenario(saved.id);
+          await updateScenario(fresh, message, false, currentToken);
+        }
+      }
+      return saved;
+    } catch (reason) { reportError(reason, token); return null; }
+    finally { actionWrites.current.delete(key); setPendingActionKeys([...actionWrites.current]); }
+  };
+
   const completeAction = async (action: Action) => {
     if (!scenario) return;
-    const token = selectionGuard.current.capture();
-    try {
-      const saved = await window.makua.completeAction({ id: scenario.id, actionId: action.id });
-      await updateScenario(saved, '「' + action.title + '」を対応済みの履歴へ移しました。', false, token);
-    } catch (reason) { reportError(reason, token); }
+    const id = scenario.id;
+    await changeAction(action, () => window.makua.completeAction({ id, actionId: action.id }), '完了を記録しました。得た回答は履歴へ任意で追加できます。');
   };
 
   const discardAction = async (action: Action) => {
     if (!scenario) return;
-    const token = selectionGuard.current.capture();
-    try {
-      const saved = await window.makua.discardAction({ id: scenario.id, actionId: action.id, reason: discardReason });
-      if (!selectionGuard.current.isCurrent(token)) { mergeScenario(saved); return; }
-      setDiscardId('');
-      setDiscardReason('');
-      await updateScenario(saved, '棄却理由とともに履歴へ移しました。', false, token);
-    } catch (reason) { reportError(reason, token); }
+    const id = scenario.id;
+    await changeAction(action, () => window.makua.discardAction({ id, actionId: action.id }), '見送りを記録しました。理由は履歴へ任意で追加できます。');
   };
 
   const restoreAction = async (action: Action) => {
     if (!scenario) return;
-    const token = selectionGuard.current.capture();
-    try {
-      const saved = await window.makua.restoreAction({ id: scenario.id, actionId: action.id });
-      await updateScenario(saved, '履歴から明示的に現在の方針へ戻しました。', false, token);
-    } catch (reason) { reportError(reason, token); }
+    const id = scenario.id;
+    await changeAction(action, () => window.makua.restoreAction({ id, actionId: action.id }), '履歴から明示的に現在の方針へ戻しました。');
+  };
+
+  const notesFor = (action: Action): ActionNotes => noteDrafts[scenario?.id + '/' + action.id] || { reason: action.retirementReason || '', resultNote: action.resultNote || '' };
+  const editActionNotes = (action: Action, notes: ActionNotes) => {
+    if (!scenario || selectionGuard.current.capture().id !== scenario.id) return;
+    const key = scenario.id + '/' + action.id;
+    setNoteDrafts((current) => ({ ...current, [key]: notes }));
+  };
+  const saveActionNotes = async (action: Action, notes: ActionNotes) => {
+    if (!scenario) return;
+    const id = scenario.id;
+    const key = id + '/' + action.id;
+    const snapshot = { ...notes };
+    const saved = await changeAction(action, () => window.makua.updateActionNotes({ id, actionId: action.id, ...snapshot }), '任意の履歴メモを保存しました。');
+    if (saved) setNoteDrafts((current) => {
+      if (current[key]?.reason !== snapshot.reason || current[key]?.resultNote !== snapshot.resultNote) return current;
+      const remaining = { ...current }; delete remaining[key]; return remaining;
+    });
   };
 
   const deleteScenario = async () => {
@@ -508,10 +537,10 @@ function App() {
         <main className={'main-content' + (page === 'settings' ? ' main-content-settings' : '')}>
           {(notice || error) && <div className={'toast ' + (error ? 'toast-error' : '')}><span>{error ? '!' : '✓'}</span><div>{error || notice}</div><button onClick={() => { setNotice(''); setError(''); }} aria-label="閉じる">×</button></div>}
           {!scenario && page !== 'settings' && <EmptyState onNew={() => setCreateOpen(true)} onDemo={createDemo} />}
-          {scenario && page === 'overview' && <Overview scenario={scenario} settings={settings} busy={busy || autoBusy} activeActions={activeActions} onEdit={() => setPage('evidence')} onPlans={() => setPage('plans')} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={(action) => { setDiscardId(action.id); setDiscardReason(''); setPage('plans'); }} />}
+          {scenario && page === 'overview' && <Overview scenario={scenario} settings={settings} busy={busy || autoBusy} activeActions={activeActions} onEdit={() => setPage('evidence')} onPlans={() => setPage('plans')} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
           {scenario && draft && page === 'evidence' && <EvidencePage scenario={scenario} title={draft.text.title} setTitle={(title) => editTextDraft({ title })} draft={draft.text.text} setDraft={(text) => editTextDraft({ text })} visibility={draft.text.visibility} setVisibility={(visibility) => editTextDraft({ visibility })} textSaving={draft.textSaving} profileSaving={draft.profileSaving} onAddText={addText} onAddFiles={addFiles} onVisibility={setEvidenceVisibility} selected={selectedEvidence} onSelect={setSelectedEvidence} preview={preview} onPreview={previewImage} onSource={goToEvidence} onProfileSave={saveProfile} profile={draft.profile} setProfile={editProfileDraft} totalChars={totalTextChars} totalBytes={totalAttachmentBytes} settings={settings} />}
-          {scenario && page === 'plans' && <PlansPage scenario={scenario} actions={activeActions} settings={settings} busy={busy || autoBusy} onAnalyze={() => runAnalysis()} onEvidence={goToEvidence} onComplete={completeAction} onDiscardStart={(action) => { setDiscardId(action.id); setDiscardReason(''); }} discardId={discardId} discardReason={discardReason} setDiscardReason={setDiscardReason} onDiscard={discardAction} onDiscardCancel={() => { setDiscardId(''); setDiscardReason(''); }} />}
-          {scenario && page === 'history' && <HistoryPage scenario={scenario} history={historyActions} onRestore={restoreAction} onEvidence={goToEvidence} />}
+          {scenario && page === 'plans' && <PlansPage scenario={scenario} actions={activeActions} settings={settings} busy={busy || autoBusy} onAnalyze={() => runAnalysis()} onEvidence={goToEvidence} onComplete={completeAction} onDiscard={discardAction} pendingActionIds={pendingActionIds} />}
+          {scenario && page === 'history' && <HistoryPage scenario={scenario} history={historyActions} onRestore={restoreAction} onEvidence={goToEvidence} notesFor={notesFor} onNotesChange={editActionNotes} onNotesSave={saveActionNotes} pendingActionIds={pendingActionIds} />}
           {page === 'settings' && <div className="settings-scroll" role="region" aria-label="接続と保存の設定" tabIndex={0}><SettingsPage settings={settings} onSettings={setSettings} onSaved={setSettings} onCodexStatus={receiveCodexStatus} codexStatus={codexStatus} onDataFolder={() => window.makua.showDataFolder()} onError={reportError} onDelete={deleteScenario} scenario={scenario} /></div>}
           {scenario && sourceView && <SourcePanel view={sourceView} title={sourceName(scenario, sourceView.request.evidenceId)} onClose={() => sourceReader.current.close()} onPage={(number) => goToEvidence(sourceView.request.evidenceId, String(number), undefined, sourceView.request.analysisIndex)}/>}
         </main>
@@ -578,9 +607,9 @@ function ScopeBadge({ visibility }: { visibility: Visibility }) {
   return <span className={'scope-badge ' + scopeClass[visibility]}><span>{visibility === 'private' ? '◈' : visibility === 'shared' ? '◉' : '◇'}</span>{scopeLabel[visibility]}</span>;
 }
 
-function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, onEvidence, onComplete, onDiscard }: {
+function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, onEvidence, onComplete, onDiscard, pendingActionIds = [] }: {
   scenario: Scenario; settings: AppSettings; busy: boolean; activeActions: Action[]; onEdit: () => void; onPlans: () => void;
-  onEvidence: (id: string) => void; onComplete: (action: Action) => void; onDiscard: (action: Action) => void;
+  onEvidence: (id: string) => void; onComplete: (action: Action) => void; onDiscard: (action: Action) => void; pendingActionIds?: string[];
 }) {
   const analysis = scenario.analysis;
   return <div className="page-stack">
@@ -614,7 +643,7 @@ function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, on
         </section>
         <section className="quick-plans">
           <div className="quick-plans-head"><div><span className="eyebrow">NEXT MOVES</span><h3>次に確かめること</h3></div><button onClick={onPlans}>すべて <span>→</span></button></div>
-          {activeActions.length ? activeActions.slice(0, 3).map((action) => <div key={action.id} className="mini-action"><div className="mini-number">{String(action.priority).padStart(2, '0')}</div><div><strong>{action.title}</strong><span>{action.who || '相手は未特定'}</span><Assumptions values={action.assumptions}/><small>{action.rationale}</small><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div></div>) : <p className="muted-copy">有効な行動はありません。新しい資料を追加して更新してください。</p>}
+          {activeActions.length ? activeActions.slice(0, 3).map((action) => <div key={action.id} className="mini-action" data-action-id={action.id}><div className="mini-number">{String(action.priority).padStart(2, '0')}</div><div><strong>{action.title}</strong><span>{action.who || '相手は未特定'}</span><Assumptions values={action.assumptions}/><ActionCare action={action}/><RecheckNotes action={action}/><small>{action.rationale}</small><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/><ActionControls action={action} onComplete={onComplete} onDiscard={onDiscard} pending={pendingActionIds.includes(action.id)}/></div></div>) : <p className="muted-copy">有効な行動はありません。新しい資料を追加して更新してください。</p>}
           {activeActions.length > 0 && <button className="button button-green plan-open" onClick={onPlans}>行動の詳細を開く <span>↗</span></button>}
         </section>
         <section className="flow-footnote"><span className="footnote-mark">i</span><div><strong>情報の種類と公開範囲は別々</strong><p>事実・仮説・未確認は内容の確かさ。全体公開・自分だけ・不明は誰が知っているかの整理です。</p></div></section>
@@ -726,49 +755,77 @@ function EvidenceCard({ item, index, selected, preview, onSelect, onVisibility, 
   </article>;
 }
 
-function PlansPage({ scenario, actions, settings, busy, onAnalyze, onEvidence, onComplete, onDiscardStart, discardId, discardReason, setDiscardReason, onDiscard, onDiscardCancel }: {
-  scenario: Scenario; actions: Action[]; settings: AppSettings; busy: boolean; onAnalyze: () => void; onEvidence: (id: string) => void; onComplete: (action: Action) => void; onDiscardStart: (action: Action) => void;
-  discardId: string; discardReason: string; setDiscardReason: (value: string) => void; onDiscard: (action: Action) => void; onDiscardCancel: () => void;
+function ActionControls({ action, onComplete, onDiscard, pending = false }: { action: Action; onComplete: (action: Action) => void; onDiscard: (action: Action) => void; pending?: boolean }) {
+  return <div className="action-controls"><button type="button" className="text-button" onClick={() => onComplete(action)} disabled={pending}>✓ 完了</button><button type="button" className="text-button danger-link" onClick={() => onDiscard(action)} disabled={pending}>見送る</button></div>;
+}
+
+function ActionCare({ action }: { action: Action }) {
+  return <div className="action-care"><span>秘密への配慮</span><p>{action.secretRisk?.trim() || '配慮の記載はありません。発言内容は未確認です。'}</p></div>;
+}
+
+function RecheckNotes({ action }: { action: Action }) {
+  if (!action.rechecks?.length) return null;
+  return <div className="action-rechecks">{action.rechecks.map((item) => <div key={item.actionId}><strong>再確認 · 前提の変化</strong><p>以前: {item.previousPremise}</p><p>今回: {item.currentPremise}</p><p>{item.reason}</p></div>)}</div>;
+}
+
+function ActionSourceScope({ scenario, action }: { scenario: Scenario; action: Action }) {
+  return <div className="action-source-scope"><span>根拠資料の公開範囲</span>{action.evidenceIds?.length ? <ScopeBadge visibility={getActionVisibility(scenario, action)}/> : <span className="scope-badge scope-unknown">参照資料なし</span>}</div>;
+}
+
+function PlansPage({ scenario, actions, settings, busy, onAnalyze, onEvidence, onComplete, onDiscard, pendingActionIds = [] }: {
+  scenario: Scenario; actions: Action[]; settings: AppSettings; busy: boolean; onAnalyze: () => void; onEvidence: (id: string) => void; onComplete: (action: Action) => void; onDiscard: (action: Action) => void; pendingActionIds?: string[];
 }) {
   return <div className="page-stack">
     <div className="page-intro"><div><div className="eyebrow">ACTIONS TO TAKE</div><h1>次に確かめること</h1><p>数字は優先順です。犯人らしさの確率ではありません。</p></div><div className="intro-metrics"><div><span>{actions.length.toString().padStart(2, '0')}</span><small>有効な方針</small></div></div></div>
-    <div className="plans-context"><div className="plan-context-icon">↗</div><div><span className="eyebrow">WHY THIS ORDER</span><strong>{scenario.roleProfile?.goal || 'HOに役・目的があれば解析で利用します。補足の入力は任意です。'}</strong><p>根拠資料へ戻り、誰に何を聞くか、目的への寄与、秘密を漏らすリスクを開いて確認できます。</p></div><button className="button button-light" onClick={onAnalyze} disabled={busy}>{busy ? '更新中…' : 'もう一度解析'}</button></div>
+    <div className="plans-context"><div className="plan-context-icon">↗</div><div><span className="eyebrow">WHY THIS ORDER</span><strong>{scenario.roleProfile?.goal || 'HOに役・目的があれば解析で利用します。補足の入力は任意です。'}</strong><p>誰に何を聞くか、秘密への配慮を先に確認できます。目的や出典は詳細から読めます。</p></div><button className="button button-light" onClick={onAnalyze} disabled={busy}>{busy ? '更新中…' : 'もう一度解析'}</button></div>
     {scenario.analysis && <div className="strategy-summary"><span>現在地</span><p>{scenario.analysis.overview}</p><div><span>解析モデル: {scenario.analysis.provider}</span><span>更新 {dateLabel(scenario.analysis.updatedAt)}</span>{scenario.analysis.usage?.input_tokens != null && <span>入力 {scenario.analysis.usage.input_tokens.toLocaleString()} / 出力 {(scenario.analysis.usage.output_tokens || 0).toLocaleString()} tokens</span>}</div></div>}
-    {actions.length ? <div className="action-list">{actions.map((action) => <article className="action-card" key={action.id}>
+    {actions.length ? <div className="action-list">{actions.map((action) => <article className="action-card" key={action.id} data-action-id={action.id}>
       <div className="action-rank"><span>優先</span><strong>{String(action.priority).padStart(2, '0')}</strong></div>
-      <div className="action-body"><div className="action-heading"><div><span className="action-kicker">NEXT ACTION</span><h2>{action.title}</h2></div><ScopeBadge visibility={getActionVisibility(scenario, action)}/></div>
+      <div className="action-body"><div className="action-heading"><div><span className="action-kicker">NEXT ACTION</span><h2>{action.title}</h2></div><ActionSourceScope scenario={scenario} action={action}/></div>
         <div className="action-one-line"><span>誰へ</span><strong>{action.who || '相手は資料から特定できていない'}</strong><span className="action-step">{action.step}</span></div>
         <Assumptions values={action.assumptions}/>
-        <div className="action-rationale"><span>優先する理由</span><p>{action.rationale}</p></div>
-        {!!action.evidenceIds?.length && <div className="action-evidence"><span>根拠</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div>}
-        <details className="action-details"><summary>質問例・目的・秘密への配慮 <span>詳細を開く　＋</span></summary>
-          <div className="action-detail-grid"><div className="detail-cell"><span>聞く・発言する内容</span><p>{action.suggestedLine || '提案文はありません。資料に沿って質問を組み立ててください。'}</p></div><div className="detail-cell"><span>目的への寄与</span><p>{action.purpose || '目的とのつながりは未確認です。'}</p></div><div className="detail-cell"><span>秘密が漏れるリスク</span><p>{action.secretRisk || 'この案のリスクは記載されていません。'}</p></div><div className="detail-cell"><span>具体的な一歩</span><p>{action.step}</p></div></div>
+        {action.suggestedLine && <p className="action-suggested-line">発言例: {action.suggestedLine}</p>}
+        <ActionCare action={action}/><RecheckNotes action={action}/>
+        <details className="action-details"><summary>理由・目的・出典の詳細 <span>詳細を開く　＋</span></summary>
+          <div className="action-detail-grid"><div className="detail-cell"><span>優先する理由</span><p>{action.rationale}</p></div><div className="detail-cell"><span>目的への寄与</span><p>{action.purpose || '目的とのつながりは未確認です。'}</p></div></div>
           {!!action.evidenceIds?.length && <div className="action-source-line"><span>参照資料</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div>}
         </details>
-        {discardId === action.id && <div className="discard-box"><label>この方針を棄却する理由<textarea rows={2} value={discardReason} onChange={(event) => setDiscardReason(event.target.value)} placeholder="例：新しい証言と矛盾したため"/></label><div><button className="text-button" onClick={onDiscardCancel}>戻る</button><button className="button button-warn" onClick={() => onDiscard(action)} disabled={discardReason.trim().length < 2}>理由を保存して棄却</button></div></div>}
-        <div className="action-controls"><button className="text-button" onClick={() => onComplete(action)}>✓ 対応済みにする</button>{discardId !== action.id && <button className="text-button danger-link" onClick={() => onDiscardStart(action)}>棄却して履歴へ</button>}</div>
+        <ActionControls action={action} onComplete={onComplete} onDiscard={onDiscard} pending={pendingActionIds.includes(action.id)}/>
       </div>
-    </article>)}</div> : <div className="no-evidence no-actions"><div className="no-evidence-mark">↗</div><strong>{scenario.analysis ? '現在有効な方針はありません' : '資料から優先行動を作ります'}</strong><p>{scenario.analysis ? '過去の方針は履歴に残っています。新しい資料で状況を更新できます。' : 'AI未接続なら設定から接続するか、資料と役の目的を先に登録してください。'}</p><button className="button button-ink" onClick={onAnalyze} disabled={busy}>{busy ? '解析中…' : '状況を解析する'}</button></div>}
+    </article>)}</div> : <div className="no-evidence no-actions"><div className="no-evidence-mark">↗</div><strong>{scenario.analysis ? '現在有効な方針はありません' : '資料から優先行動を作ります'}</strong><p>{scenario.analysis ? '過去の方針は履歴に残っています。新しい資料で状況を更新できます。' : 'AI未接続なら設定から接続するか、資料を先に登録してください。'}</p><button className="button button-ink" onClick={onAnalyze} disabled={busy}>{busy ? '解析中…' : '状況を解析する'}</button></div>}
     {settings.provider === 'none' && <div className="plain-mode-note"><span>i</span>AI未接続のとき、アプリは行動を自動生成しません。方針はAI接続後に資料から提案されます。</div>}
   </div>;
 }
 
 function getActionVisibility(scenario: Scenario, action: Action): Visibility {
-  const scopes = action.evidenceIds.map((id) => (scenario.evidence.find((item) => item.id === id) || savedAnalysisSources(scenario).find((item) => item.id === id))?.visibility).filter(Boolean) as Visibility[];
+  const scopes = (action.evidenceIds || []).map((id) => (scenario.evidence.find((item) => item.id === id) || savedAnalysisSources(scenario).find((item) => item.id === id))?.visibility || 'unknown');
   if (scopes.includes('private')) return 'private';
-  if (scopes.includes('unknown') || !scopes.length) return 'unknown';
+  if (!scopes.length || scopes.includes('unknown')) return 'unknown';
   return 'shared';
 }
 
-function HistoryPage({ scenario, history, onRestore, onEvidence }: { scenario: Scenario; history: Action[]; onRestore: (action: Action) => void; onEvidence: (id: string) => void }) {
-  const label = (status: string) => status === 'discarded' ? '手動で棄却' : status === 'completed' ? '対応済み' : status === 'restored' ? '履歴から復帰' : '更新で置き換え';
+function HistoryNoteEditor({ action, notes, onChange, onSave, pending = false }: { action: Action; notes: ActionNotes; onChange: (notes: ActionNotes) => void; onSave: (notes: ActionNotes) => void; pending?: boolean }) {
+  return <details className="history-note-editor"><summary>理由・得た回答をメモする（任意）</summary><form onSubmit={(event) => { event.preventDefault(); if (!pending) onSave({ ...notes }); }}>
+    <label>{action.status === 'discarded' ? '見送り理由（任意）' : '補足・理由（任意）'}<textarea rows={2} value={notes.reason} onChange={(event) => onChange({ ...notes, reason: event.target.value })}/></label>
+    <label>得た回答（任意・履歴メモ）<textarea rows={2} value={notes.resultNote} onChange={(event) => onChange({ ...notes, resultNote: event.target.value })}/></label>
+    <button type="submit" className="button button-light" disabled={pending}>{pending ? '保存中…' : '任意のメモを保存'}</button>
+  </form></details>;
+}
+
+function HistoryPage({ scenario, history, onRestore, onEvidence, notesFor, onNotesChange, onNotesSave, pendingActionIds = [] }: {
+  scenario: Scenario; history: Action[]; onRestore: (action: Action) => void; onEvidence: (id: string) => void;
+  notesFor?: (action: Action) => ActionNotes; onNotesChange?: (action: Action, notes: ActionNotes) => void; onNotesSave?: (action: Action, notes: ActionNotes) => void; pendingActionIds?: string[];
+}) {
+  const label = (status: string) => status === 'discarded' ? '見送り' : status === 'completed' ? '完了' : status === 'restored' ? '履歴から復帰' : '更新で置き換え';
   return <div className="page-stack">
-    <div className="page-intro"><div><div className="eyebrow">DECISION TRAIL</div><h1>方針の履歴</h1><p>棄却・対応済み・解析更新で外れた方針を、理由とつながりごとに残します。</p></div><div className="intro-metrics"><div><span>{history.length.toString().padStart(2, '0')}</span><small>記録</small></div></div></div>
-    {history.length ? <div className="history-list">{[...history].reverse().map((action, index) => <article className="history-card" key={action.id + '-' + index}>
+    <div className="page-intro"><div><div className="eyebrow">DECISION TRAIL</div><h1>方針の履歴</h1><p>完了・見送り・解析更新で外れた行動を、日時とつながりごとに残します。理由と得た回答は任意です。</p></div><div className="intro-metrics"><div><span>{history.length.toString().padStart(2, '0')}</span><small>記録</small></div></div></div>
+    {history.length ? <div className="history-list">{[...history].reverse().map((action, index) => <article className="history-card" key={scenario.id + '/' + action.id + '-' + index} data-history-id={action.id}>
       <div className="history-status"><span className={'history-mark status-' + action.status}>{action.status === 'completed' ? '✓' : action.status === 'discarded' ? '×' : '↶'}</span><div><strong>{label(action.status)}</strong><small>{dateLabel(action.retiredAt || action.updatedAt || action.createdAt)}</small></div></div>
-      <div className="history-main"><h3>{action.title}</h3><Assumptions values={action.assumptions}/><p>{action.retirementReason || '理由の記録はありません。'}</p><details><summary>保存した方針を見る</summary><p>{action.step}</p><p>{action.suggestedLine}</p><p>{action.purpose}</p><p>{action.rationale}</p><p>{action.secretRisk}</p></details><div className="history-meta"><span>対象: {action.who || '未特定'}</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div></div>
-      {action.status === 'discarded' && <button className="button button-light restore-button" onClick={() => onRestore(action)}>明示的に復帰</button>}
-    </article>)}</div> : <div className="no-evidence"><div className="no-evidence-mark">↶</div><strong>まだ履歴はありません</strong><p>方針を対応済み・棄却・置き換えにしたとき、ここに理由と日時が残ります。</p></div>}
+      <div className="history-main"><h3>{action.title}</h3><Assumptions values={action.assumptions}/><p>{action.retirementReason || '理由のメモはありません。'}</p>{action.resultNote && <p>得た回答: {action.resultNote}</p>}<RecheckNotes action={action}/><details><summary>保存した方針を見る</summary><p>{action.step}</p><p>{action.suggestedLine}</p><p>{action.purpose}</p><p>{action.rationale}</p><p>{action.secretRisk}</p></details><div className="history-meta"><span>対象: {action.who || '未特定'}</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div>
+        {['completed', 'discarded'].includes(action.status) && onNotesSave && <HistoryNoteEditor action={action} notes={notesFor?.(action) || { reason: action.retirementReason || '', resultNote: action.resultNote || '' }} onChange={(notes) => onNotesChange?.(action, notes)} onSave={(notes) => onNotesSave(action, notes)} pending={pendingActionIds.includes(action.id)}/>}
+      </div>
+      {action.status === 'discarded' && <button className="button button-light restore-button" onClick={() => onRestore(action)} disabled={pendingActionIds.includes(action.id)}>明示的に復帰</button>}
+    </article>)}</div> : <div className="no-evidence"><div className="no-evidence-mark">↶</div><strong>まだ履歴はありません</strong><p>行動を完了・見送り・置き換えにしたとき、ここに内容と日時が残ります。</p></div>}
     {(scenario.analysisHistory || []).slice().reverse().map((analysis, index) => <details className="panel previous-analysis" key={analysis.revision + '-' + index}>
       <summary>送信対象から外した以前の整理結果 · {dateLabel(analysis.updatedAt)}</summary>
       <p className="muted-copy">このPCで閲覧できます。役情報OFFの解析には送信しません。</p>
@@ -879,7 +936,7 @@ function SettingsPage({ settings, onSettings, onSaved, onCodexStatus, codexStatu
           <div className="privacy-callout"><span>◈</span><div><strong>キーはWindowsの暗号化ストレージに保存</strong><p>キーを画面へ再表示せず、ソース・ログ・バックアップには含めません。アプリはOpenAI APIへ直接接続します。</p></div></div>
           {settings.hasKey && <label className="checkbox-row danger-check"><input type="checkbox" checked={removeKey} onChange={(event) => setRemoveKey(event.target.checked)}/>保存済みのAPIキーを削除</label>}
           <div className="pricing-note"><strong>費用の目安（公式単価）</strong><p>Lunaは入力 $0.10 / 出力 $0.50、Solは $2 / $10、Astraは $10 / $50（100万トークンあたり）。画像・PDFページは追加の入力トークンになり、実際の請求額は送信量と利用状況で変わります。速度はこのPCから実測していません。</p><small>標準は低コストのGPT-6 Luna / medium。モデルはいつでも切替でき、上位モデルへ自動昇格しません。</small></div>
-          <label className="checkbox-row consent-row"><input type="checkbox" checked={draft.cloudConsent} onChange={(event) => set('cloudConsent', event.target.checked)}/><span><strong>OpenAIへ資料を送ることを理解しました。</strong><small>シナリオ概要・全テキスト資料・PDF原本・画像に加え、役情報の送信設定で許可された有効方針・仮説・棄却履歴を送信します。プロフィールと過去の整理結果の送信範囲は下の設定に従います。接続テストと解析はAPI利用料がかかる場合があります。</small></span></label>
+          <label className="checkbox-row consent-row"><input type="checkbox" checked={draft.cloudConsent} onChange={(event) => set('cloudConsent', event.target.checked)}/><span><strong>OpenAIへ資料を送ることを理解しました。</strong><small>シナリオ概要・全テキスト資料・PDF原本・画像に加え、役情報の送信設定で許可された有効方針・仮説・行動履歴（完了・見送り・更新、任意メモ）を送信します。プロフィールと過去の整理結果の送信範囲は下の設定に従います。接続テストと解析はAPI利用料がかかる場合があります。</small></span></label>
         </div>}
         {draft.provider === 'ollama' && <div className="provider-fields"><div className="settings-fields-row"><label className="field-label">localhost URL<input value={draft.ollamaUrl} onChange={(event) => set('ollamaUrl', event.target.value)} placeholder="http://localhost:11434"/></label><label className="field-label">モデル名<input value={draft.ollamaModel} onChange={(event) => set('ollamaModel', event.target.value)} placeholder="インストール済みのモデル名"/></label></div><div className="privacy-callout"><span>⌂</span><div><strong>ローカル接続として確認するのはlocalhostのみ</strong><p>画像は選択モデルへ送りますが、モデルごとのVision対応は自動判定していません。PDFはローカル抽出できたテキストだけを送り、ページ画像は解析しません。</p></div></div></div>}
         {draft.provider === 'codex' && <div className="provider-fields codex-fields">
@@ -896,7 +953,7 @@ function SettingsPage({ settings, onSettings, onSaved, onCodexStatus, codexStatu
           <div className="codex-connection-row"><div><strong>{codexStatus?.ready ? '接続済み' : codexStatus?.authenticated ? 'サインイン済み・モデル未確認' : '接続状態未確認'}</strong><small>{codexStatus?.planType ? 'ChatGPTプラン: ' + codexStatus.planType : '専用profileのChatGPTサインインを確認します。'}</small></div><div className="codex-connection-actions"><button type="button" className="button button-light" onClick={startCodexLogin} disabled={testing}>{testing ? '確認中…' : 'ChatGPTでサインイン'}</button><button type="button" className="button button-light" onClick={test} disabled={testing}>{testing ? '確認中…' : '接続状態を確認'}</button>{loginCode && <button type="button" className="text-button" onClick={cancelCodexLogin} disabled={testing}>サインインを中止</button>}</div></div>
           {loginCode && <div className="codex-login-code"><div><span>公式デバイス認証URL（自分で開いてください）</span><code>{loginCode.verificationUrl}</code></div><div><span>一時コード</span><code>{loginCode.userCode}</code></div><small>アプリはブラウザーを開きません。コードを入力した後、この画面の「接続状態を確認」を押してください。</small></div>}
           {codexUsage && <div className="codex-usage"><strong>Codex利用枠</strong><span>現在のウィンドウ使用量 {codexUsage.usedPercent}%</span>{codexUsage.resetsAt && <small>リセット予定: {new Intl.DateTimeFormat('ja-JP', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(codexUsage.resetsAt * 1000))}</small>}</div>}
-          <div className="privacy-callout codex-callout"><span>◈</span><div><strong>PlusのCodex枠を使う実験的な接続</strong><p>Platform APIキー・API従量課金へ切り替えません。アプリ専用profileに公式ChatGPT managed sign-inを行い、そのCodex利用枠を使います。通常のCodex profileにある認証ファイルやMCP設定は引き継ぎません。</p><p>解析時はシナリオ概要・全テキスト・画像・PDF抽出全文と全ページ画像に加え、役情報の送信設定で許可された有効方針・仮説・棄却履歴をCodexへ送ります。プロフィールと過去の整理結果の送信範囲は下の設定に従います。PDF画像は解析後に一時ファイルを削除し、原本はローカルに残します。</p><p>shell、apps、remote plugins、multi-agent、web searchを設定で無効化し、read-only sandboxとネットワーク無効を指定します。未対応のツール/権限要求は受け入れません。ただしread-only sandboxに読み取り対象を個別指定する仕組みはなく、App Serverも内部機能すべてを無効にできる保証はありません。空の作業フォルダーだけにアクセスを限定できるとは言えないため、実験的な接続の制約を理解してから使ってください。</p></div></div>
+          <div className="privacy-callout codex-callout"><span>◈</span><div><strong>PlusのCodex枠を使う実験的な接続</strong><p>Platform APIキー・API従量課金へ切り替えません。アプリ専用profileに公式ChatGPT managed sign-inを行い、そのCodex利用枠を使います。通常のCodex profileにある認証ファイルやMCP設定は引き継ぎません。</p><p>解析時はシナリオ概要・全テキスト・画像・PDF抽出全文と全ページ画像に加え、役情報の送信設定で許可された有効方針・仮説・行動履歴（完了・見送り・更新、任意メモ）をCodexへ送ります。プロフィールと過去の整理結果の送信範囲は下の設定に従います。PDF画像は解析後に一時ファイルを削除し、原本はローカルに残します。</p><p>shell、apps、remote plugins、multi-agent、web searchを設定で無効化し、read-only sandboxとネットワーク無効を指定します。未対応のツール/権限要求は受け入れません。ただしread-only sandboxに読み取り対象を個別指定する仕組みはなく、App Serverも内部機能すべてを無効にできる保証はありません。空の作業フォルダーだけにアクセスを限定できるとは言えないため、実験的な接続の制約を理解してから使ってください。</p></div></div>
           <div className="pricing-note"><strong>アプリ側の解析上限とモデル選択</strong><p>資料は切り捨てず、1解析の添付合計40MiB・入力全文字数30万字・PDF合計200ページ・生成画像40MiBを超えると停止します。これはCodexの公称上限ではなく、このアプリの安全上限です。利用できるモデルと画像対応はCodexの一覧を取得して表示し、自動で別モデルへ切り替えません。</p></div>
           <label className="checkbox-row consent-row"><input type="checkbox" checked={draft.codexConsent} onChange={(event) => set('codexConsent', event.target.checked)}/><span><strong>Codexへ資料を送ることを理解しました。</strong><small>同意すると手動解析が有効になります。自動更新をONにした場合は、資料変更後に追加確認なしで同じ範囲を送ります。</small></span></label>
         </div>}

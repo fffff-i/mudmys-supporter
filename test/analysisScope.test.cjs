@@ -47,7 +47,7 @@ test('mixed restored actions and every history status are filtered using their o
   assert.deepEqual(off.activeActionIds, ['allowed']);
   assert.deepEqual(off.excludedActionIds, ['protected', 'unknown']);
   assert.deepEqual(off.caseRecord.actionHistory.map((item) => item.id), ['allowed-completed', 'allowed-discarded', 'allowed-retired', 'allowed-restored']);
-  assert.deepEqual(off.historyActionIds, ['allowed-discarded']);
+  assert.deepEqual(off.historyActionIds, ['allowed-completed', 'allowed-discarded', 'allowed-retired', 'allowed-restored']);
   assert.equal(off.previousContextMayIncludeRoleProfile, false);
   const on = getAnalysisContext(base, true);
   assert.equal(on.activeActionIds.length, 3);
