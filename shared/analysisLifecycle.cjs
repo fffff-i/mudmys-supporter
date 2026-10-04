@@ -1,4 +1,5 @@
 const { randomUUID } = require('node:crypto');
+const { getAnalysisSources, getFixedAnalysisSources } = require('./analysisSources.cjs');
 
 function normalize(text) {
   return String(text || '').normalize('NFKC').toLowerCase().replace(/[\s、。！？!?・.,:：;；「」『』()（）]/g, '');
@@ -26,28 +27,47 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function applyAnalysis(current, output, expectedRevision, generatedAt = new Date().toISOString()) {
+function applyAnalysis(current, output, expectedRevision, generatedAt = new Date().toISOString(), options = {}) {
   assert(current.revision === expectedRevision, 'この解析より新しい変更があるため、結果を破棄しました。');
   assert(output && typeof output.overview === 'string', '解析結果の形式を確認できませんでした。');
 
-  const evidenceById = new Map((current.evidence || []).map((entry) => [entry.id, entry]));
+  const evidenceById = new Map(getAnalysisSources(current, options).map((entry) => [entry.id, entry]));
   const evidenceIds = new Set(evidenceById.keys());
   const previous = current.analysis && current.analysis.actions ? current.analysis.actions : [];
   const oldById = new Map(previous.map((action) => [action.id, action]));
   const activeIds = new Set(previous.filter((action) => action.status === 'active').map((action) => action.id));
   const seenDisposition = new Set();
+  // The existing action context can contain role-derived prose even when the
+  // profile itself is off. Keep the new hypothesis context conservative too.
+  // A request builder that filters that prose may explicitly supply false.
+  const previousContextMayIncludeRoleProfile = options.previousContextMayIncludeRoleProfile ?? Boolean(
+    (activeIds.size && (current.analysis?.grounding?.includeRoleProfile !== false || current.analysis?.grounding?.previousContextMayIncludeRoleProfile)) ||
+    (current.actionHistory || []).some((action) => action.status === 'discarded')
+  );
 
-  const validateRefs = (records, label) => {
+  const validateRefs = (records, label, required = false) => {
     for (const record of records || []) {
       assert(Array.isArray(record.evidenceIds), label + 'に根拠IDがありません。');
-      for (const id of record.evidenceIds) assert(evidenceIds.has(id), '存在しない資料IDが解析結果に含まれました。');
+      if (required) assert(record.evidenceIds.length > 0, '事実には実在する出典が必要です。');
+      for (const id of record.evidenceIds) assert(typeof id === 'string' && evidenceIds.has(id), '存在しない資料IDまたは今回送信していない出典IDが解析結果に含まれました。');
     }
   };
   validateRefs(output.flow, '流れ');
-  validateRefs(output.facts, '事実');
+  validateRefs(output.facts, '事実', true);
   validateRefs(output.hypotheses, '仮説');
   validateRefs(output.unknowns, '未確認事項');
   validateRefs(output.actions, '方針');
+  const assumptionsFor = (record, fallback = []) => {
+    // Legacy results omit this field. Newly generated output always supplies it.
+    const assumptions = record.assumptions === undefined ? fallback : record.assumptions;
+    assert(Array.isArray(assumptions) && assumptions.every((value) => typeof value === 'string' && value.trim()), '仮定は未確認の条件を表す文字列の配列にしてください。');
+    return assumptions.map((value) => value.trim());
+  };
+  const hypotheses = (output.hypotheses || []).map((item) => ({
+    ...item,
+    assumptions: assumptionsFor(item, (current.analysis?.hypotheses || []).find((old) => old.statement === item.statement)?.assumptions || [])
+  }));
+  for (const action of output.actions || []) assumptionsFor(action);
   const events = (output.events || []).map((event) => {
     const source = evidenceById.get(event.sourceId);
     assert(source, 'イベントに存在しない資料IDが含まれました。');
@@ -95,6 +115,8 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
   const assigned = prepared.map((action) => {
     const continuedId = (action.continuesActionIds || [])[0];
     const old = continuedId ? oldById.get(continuedId) : null;
+    const inheritedAssumptions = [...new Set([...(action.continuesActionIds || []), ...(action.replacesActionIds || [])]
+      .flatMap((id) => oldById.get(id)?.assumptions || []))];
     return {
       id: old ? old.id : randomUUID(),
       title: action.title,
@@ -106,6 +128,7 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       rationale: action.rationale,
       priority: action.priority,
       evidenceIds: action.evidenceIds,
+      assumptions: assumptionsFor(action, inheritedAssumptions),
       status: 'active',
       createdAt: old ? old.createdAt : generatedAt,
       updatedAt: generatedAt
@@ -149,10 +172,12 @@ function applyAnalysis(current, output, expectedRevision, generatedAt = new Date
       flow: output.flow || [],
       events,
       facts: output.facts || [],
-      hypotheses: output.hypotheses || [],
+      hypotheses,
       unknowns: output.unknowns || [],
       actions: assigned.sort((a, b) => a.priority - b.priority),
-      provider: output.provider || 'AI'
+      provider: output.provider || 'AI',
+      sources: getFixedAnalysisSources(current, options),
+      grounding: { includeRoleProfile: options.includeRoleProfile === true, previousContextMayIncludeRoleProfile, evidenceIds: [...evidenceIds] }
     },
     actionHistory: history
   };
@@ -196,6 +221,7 @@ function restoreAction(current, actionId, generatedAt = new Date().toISOString()
     rationale: source.rationale,
     priority: source.priority,
     evidenceIds: source.evidenceIds || [],
+    assumptions: source.assumptions || [],
     status: 'active',
     createdAt: generatedAt,
     updatedAt: generatedAt,

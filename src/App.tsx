@@ -37,7 +37,7 @@ function typeLabel(type: string) {
 
 function sourceName(scenario: Scenario, id: string) {
   const index = scenario.evidence.findIndex((entry) => entry.id === id);
-  return index >= 0 ? '資料 ' + String(index + 1).padStart(2, '0') + '　' + scenario.evidence[index].title : '資料がありません';
+  return index >= 0 ? '資料 ' + String(index + 1).padStart(2, '0') + '　' + scenario.evidence[index].title : scenario.analysis?.sources?.find((source) => source.id === id)?.title || '資料がありません';
 }
 
 function App() {
@@ -465,13 +465,20 @@ function SectionHeading({ overline, title, note }: { overline: string; title: st
 
 function Citation({ scenario, id, onEvidence }: { scenario: Scenario; id: string; onEvidence: (id: string) => void }) {
   const index = scenario.evidence.findIndex((item) => item.id === id);
+  const source = scenario.analysis?.sources?.find((item) => item.id === id);
+  if (source) return <button className="citation-chip" onClick={() => onEvidence(id)} title="解析に使った内容を開く">{source.title}　↗</button>;
   if (index < 0) return <span className="citation-missing">資料なし</span>;
   return <button className="citation-chip" onClick={() => onEvidence(id)} title="元の資料を開く">証拠 {String(index + 1).padStart(2, '0')}　↗</button>;
 }
 
 function Citations({ scenario, ids, onEvidence }: { scenario: Scenario; ids: string[]; onEvidence: (id: string) => void }) {
-  if (!ids?.length) return <span className="citation-none">直接の資料根拠なし</span>;
+  if (!ids?.length) return null;
   return <span className="citations">{ids.map((id) => <Citation key={id} scenario={scenario} id={id} onEvidence={onEvidence}/>)}</span>;
+}
+
+function Assumptions({ values }: { values?: string[] }) {
+  if (!values?.length) return null;
+  return <div className="assumption-note"><span>仮定（未確認）</span><p>{values.join('／')}</p></div>;
 }
 
 function ScopeBadge({ visibility }: { visibility: Visibility }) {
@@ -514,7 +521,7 @@ function Overview({ scenario, settings, busy, activeActions, onEdit, onPlans, on
         </section>
         <section className="quick-plans">
           <div className="quick-plans-head"><div><span className="eyebrow">NEXT MOVES</span><h3>次に確かめること</h3></div><button onClick={onPlans}>すべて <span>→</span></button></div>
-          {activeActions.length ? activeActions.slice(0, 3).map((action) => <div key={action.id} className="mini-action"><div className="mini-number">{String(action.priority).padStart(2, '0')}</div><div><strong>{action.title}</strong><span>{action.who || '相手は未特定'}</span><small>{action.rationale}</small><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div></div>) : <p className="muted-copy">有効な行動はありません。新しい資料を追加して更新してください。</p>}
+          {activeActions.length ? activeActions.slice(0, 3).map((action) => <div key={action.id} className="mini-action"><div className="mini-number">{String(action.priority).padStart(2, '0')}</div><div><strong>{action.title}</strong><span>{action.who || '相手は未特定'}</span><Assumptions values={action.assumptions}/><small>{action.rationale}</small><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div></div>) : <p className="muted-copy">有効な行動はありません。新しい資料を追加して更新してください。</p>}
           {activeActions.length > 0 && <button className="button button-green plan-open" onClick={onPlans}>行動の詳細を開く <span>↗</span></button>}
         </section>
         <section className="flow-footnote"><span className="footnote-mark">i</span><div><strong>情報の種類と公開範囲は別々</strong><p>事実・仮説・未確認は内容の確かさ。全体公開・自分だけ・不明は誰が知っているかの整理です。</p></div></section>
@@ -536,14 +543,14 @@ function EventRow({ event, scenario, onEvidence }: { event: Scenario['analysis']
   </article>;
 }
 
-function SignalPanel({ type, label, count, items, scenario, onEvidence }: { type: 'fact' | 'hypothesis' | 'unknown'; label: string; count: number; items: any[]; scenario: Scenario; onEvidence: (id: string) => void }) {
+function SignalPanel({ type, label, count, items, scenario, onEvidence }: { type: 'fact' | 'hypothesis' | 'unknown'; label: string; count: number; items: { statement?: string; question?: string; why?: string; evidenceIds: string[]; assumptions?: string[] }[]; scenario: Scenario; onEvidence: (id: string) => void }) {
   return <section className={'signal-panel signal-' + type}><div className="signal-head"><span className="signal-mark">{type === 'fact' ? '■' : type === 'hypothesis' ? '◧' : '○'}</span><span>{label}</span><span className="signal-count">{String(count).padStart(2, '0')}</span></div>
-    {items.length ? items.slice(0, 3).map((item, index) => <div key={index} className="signal-item"><p>{item.statement || item.question}</p>{item.why && <small>{item.why}</small>}<Citations scenario={scenario} ids={item.evidenceIds || []} onEvidence={onEvidence}/></div>) : <p className="signal-empty">{type === 'fact' ? '資料に明記された事実はまだありません。' : type === 'hypothesis' ? '今の資料から立てた仮説はありません。' : '未確認の問いはありません。'}</p>}
+    {items.length ? items.slice(0, 3).map((item, index) => <div key={index} className="signal-item"><p>{item.statement || item.question}</p>{type === 'hypothesis' && <Assumptions values={item.assumptions}/>} {item.why && <small>{item.why}</small>}<Citations scenario={scenario} ids={item.evidenceIds || []} onEvidence={onEvidence}/></div>) : <p className="signal-empty">{type === 'fact' ? '資料に明記された事実はまだありません。' : type === 'hypothesis' ? '仮説・読み取りはまだありません。' : '未確認の問いはありません。'}</p>}
   </section>;
 }
 
 function ScenarioSetupForm({ scenario, onSave }: { scenario: Scenario; onSave: (next: () => Promise<void>) => void }) {
-  return <div className="setup-reminder"><div className="setup-reminder-icon">✎</div><div><strong>シナリオ概要とあなたの目的を記録できます</strong><p>役柄を登録しない場合、アプリは役や目的を推測しません。原資料は別途「資料を追加」へ保存します。</p></div></div>;
+  return <div className="setup-reminder"><div className="setup-reminder-icon">✎</div><div><strong>シナリオ概要とあなたの目的を記録できます</strong><p>HOに書かれた役・目的は解析で読み取ります。別欄への補足は任意です。原資料は「資料を追加」へ保存します。</p></div></div>;
 }
 
 function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, setVisibility, onAddText, onAddFiles, onVisibility, selected, onSelect, preview, onPreview, onProfileSave, profile, setProfile, totalChars, totalBytes, settings }: {
@@ -571,7 +578,7 @@ function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, 
         </div>
         <form className="panel profile-panel" onSubmit={onProfileSave}>
           <div className="panel-top"><div><span className="panel-kicker">MY CHARACTER</span><h2>自分の役と目的</h2></div><span className="lock-icon">◈</span></div>
-          <p className="panel-subcopy">役の目的達成を中心に、質問・発言の順番を考えます。未入力なら目的を推測しません。</p>
+          <p className="panel-subcopy">HOの役・目的は解析で読み取るため、ここへの再入力は不要です。補足したいことがあれば任意で保存できます。</p>
           <label className="field-label">シナリオ名<input value={profile.title} onChange={(event) => setProfile({ ...profile, title: event.target.value })}/></label>
           <label className="field-label">シナリオ概要<textarea rows={4} value={profile.synopsis} onChange={(event) => setProfile({ ...profile, synopsis: event.target.value })} placeholder="場面、登場人物、進行上の前提など。大事な情報を削らずに保存します。"/></label>
           <details className="role-details" open>
@@ -584,6 +591,10 @@ function EvidencePage({ scenario, title, setTitle, draft, setDraft, visibility, 
         </form>
       </div>
       <div className="evidence-list-column">
+        {scenario.analysis?.sources?.filter((source) => source.id === selected).map((source) => <article key={source.id} id={'evidence-' + source.id} className="evidence-card selected">
+          <div className="evidence-card-head"><strong>{source.title}</strong><ScopeBadge visibility={source.visibility}/></div>
+          <div className="evidence-detail"><p className="muted-copy">解析に使った内容</p><pre className="raw-source">{source.extractedText}</pre></div>
+        </article>)}
         <div className="evidence-list-head"><div><span className="eyebrow">SAVED MATERIALS</span><h2>資料一覧 <span>{scenario.evidence.length}</span></h2></div><span className="scope-reminder">公開範囲は資料ごと</span></div>
         {scenario.evidence.length ? <div className="evidence-cards">{scenario.evidence.map((item, index) => <EvidenceCard key={item.id} item={item} index={index} selected={selected === item.id} preview={preview} onSelect={() => onSelect(selected === item.id ? '' : item.id)} onVisibility={onVisibility} onPreview={onPreview}/>)}</div> : <div className="no-evidence"><div className="no-evidence-mark">＋</div><strong>まだ資料はありません</strong><p>テキストを貼り付けるか、PDFやスクリーンショットを追加します。</p></div>}
         <div className="preserve-note"><span>◈</span><p><strong>原本は要約で置き換わりません。</strong><br/>AIの概要・イベント表は参照用の索引です。原文と添付ファイルは別に保存し続けます。</p></div>
@@ -619,17 +630,18 @@ function PlansPage({ scenario, actions, settings, busy, onAnalyze, onEvidence, o
 }) {
   return <div className="page-stack">
     <div className="page-intro"><div><div className="eyebrow">ACTIONS TO TAKE</div><h1>次に確かめること</h1><p>数字は優先順です。犯人らしさの確率ではありません。</p></div><div className="intro-metrics"><div><span>{actions.length.toString().padStart(2, '0')}</span><small>有効な方針</small></div></div></div>
-    <div className="plans-context"><div className="plan-context-icon">↗</div><div><span className="eyebrow">WHY THIS ORDER</span><strong>{scenario.roleProfile?.goal || '目的は未登録。役柄を決めつけず、確認できる事実と問いを中心にしています。'}</strong><p>根拠資料へ戻り、誰に何を聞くか、目的への寄与、秘密を漏らすリスクを開いて確認できます。</p></div><button className="button button-light" onClick={onAnalyze} disabled={busy}>{busy ? '更新中…' : 'もう一度解析'}</button></div>
+    <div className="plans-context"><div className="plan-context-icon">↗</div><div><span className="eyebrow">WHY THIS ORDER</span><strong>{scenario.roleProfile?.goal || 'HOに役・目的があれば解析で利用します。補足の入力は任意です。'}</strong><p>根拠資料へ戻り、誰に何を聞くか、目的への寄与、秘密を漏らすリスクを開いて確認できます。</p></div><button className="button button-light" onClick={onAnalyze} disabled={busy}>{busy ? '更新中…' : 'もう一度解析'}</button></div>
     {scenario.analysis && <div className="strategy-summary"><span>現在地</span><p>{scenario.analysis.overview}</p><div><span>解析モデル: {scenario.analysis.provider}</span><span>更新 {dateLabel(scenario.analysis.updatedAt)}</span>{scenario.analysis.usage?.input_tokens != null && <span>入力 {scenario.analysis.usage.input_tokens.toLocaleString()} / 出力 {(scenario.analysis.usage.output_tokens || 0).toLocaleString()} tokens</span>}</div></div>}
     {actions.length ? <div className="action-list">{actions.map((action) => <article className="action-card" key={action.id}>
       <div className="action-rank"><span>優先</span><strong>{String(action.priority).padStart(2, '0')}</strong></div>
       <div className="action-body"><div className="action-heading"><div><span className="action-kicker">NEXT ACTION</span><h2>{action.title}</h2></div><ScopeBadge visibility={getActionVisibility(scenario, action)}/></div>
         <div className="action-one-line"><span>誰へ</span><strong>{action.who || '相手は資料から特定できていない'}</strong><span className="action-step">{action.step}</span></div>
+        <Assumptions values={action.assumptions}/>
         <div className="action-rationale"><span>優先する理由</span><p>{action.rationale}</p></div>
-        <div className="action-evidence"><span>根拠</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div>
+        {!!action.evidenceIds?.length && <div className="action-evidence"><span>根拠</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div>}
         <details className="action-details"><summary>質問例・目的・秘密への配慮 <span>詳細を開く　＋</span></summary>
           <div className="action-detail-grid"><div className="detail-cell"><span>聞く・発言する内容</span><p>{action.suggestedLine || '提案文はありません。資料に沿って質問を組み立ててください。'}</p></div><div className="detail-cell"><span>目的への寄与</span><p>{action.purpose || '目的とのつながりは未確認です。'}</p></div><div className="detail-cell"><span>秘密が漏れるリスク</span><p>{action.secretRisk || 'この案のリスクは記載されていません。'}</p></div><div className="detail-cell"><span>具体的な一歩</span><p>{action.step}</p></div></div>
-          <div className="action-source-line"><span>参照資料</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div>
+          {!!action.evidenceIds?.length && <div className="action-source-line"><span>参照資料</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div>}
         </details>
         {discardId === action.id && <div className="discard-box"><label>この方針を棄却する理由<textarea rows={2} value={discardReason} onChange={(event) => setDiscardReason(event.target.value)} placeholder="例：新しい証言と矛盾したため"/></label><div><button className="text-button" onClick={onDiscardCancel}>戻る</button><button className="button button-warn" onClick={() => onDiscard(action)} disabled={discardReason.trim().length < 2}>理由を保存して棄却</button></div></div>}
         <div className="action-controls"><button className="text-button" onClick={() => onComplete(action)}>✓ 対応済みにする</button>{discardId !== action.id && <button className="text-button danger-link" onClick={() => onDiscardStart(action)}>棄却して履歴へ</button>}</div>
@@ -640,7 +652,7 @@ function PlansPage({ scenario, actions, settings, busy, onAnalyze, onEvidence, o
 }
 
 function getActionVisibility(scenario: Scenario, action: Action): Visibility {
-  const scopes = action.evidenceIds.map((id) => scenario.evidence.find((item) => item.id === id)?.visibility).filter(Boolean) as Visibility[];
+  const scopes = action.evidenceIds.map((id) => (scenario.evidence.find((item) => item.id === id) || scenario.analysis?.sources?.find((item) => item.id === id))?.visibility).filter(Boolean) as Visibility[];
   if (scopes.includes('private')) return 'private';
   if (scopes.includes('unknown') || !scopes.length) return 'unknown';
   return 'shared';
@@ -652,7 +664,7 @@ function HistoryPage({ scenario, history, onRestore, onEvidence }: { scenario: S
     <div className="page-intro"><div><div className="eyebrow">DECISION TRAIL</div><h1>方針の履歴</h1><p>棄却・対応済み・解析更新で外れた方針を、理由とつながりごとに残します。</p></div><div className="intro-metrics"><div><span>{history.length.toString().padStart(2, '0')}</span><small>記録</small></div></div></div>
     {history.length ? <div className="history-list">{[...history].reverse().map((action, index) => <article className="history-card" key={action.id + '-' + index}>
       <div className="history-status"><span className={'history-mark status-' + action.status}>{action.status === 'completed' ? '✓' : action.status === 'discarded' ? '×' : '↶'}</span><div><strong>{label(action.status)}</strong><small>{dateLabel(action.retiredAt || action.updatedAt || action.createdAt)}</small></div></div>
-      <div className="history-main"><h3>{action.title}</h3><p>{action.retirementReason || '理由の記録はありません。'}</p><div className="history-meta"><span>対象: {action.who || '未特定'}</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div></div>
+      <div className="history-main"><h3>{action.title}</h3><Assumptions values={action.assumptions}/><p>{action.retirementReason || '理由の記録はありません。'}</p><div className="history-meta"><span>対象: {action.who || '未特定'}</span><Citations scenario={scenario} ids={action.evidenceIds} onEvidence={onEvidence}/></div></div>
       {action.status === 'discarded' && <button className="button button-light restore-button" onClick={() => onRestore(action)}>明示的に復帰</button>}
     </article>)}</div> : <div className="no-evidence"><div className="no-evidence-mark">↶</div><strong>まだ履歴はありません</strong><p>方針を対応済み・棄却・置き換えにしたとき、ここに理由と日時が残ります。</p></div>}
   </div>;

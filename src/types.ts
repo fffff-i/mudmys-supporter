@@ -38,6 +38,8 @@ export type Action = {
   rationale: string;
   priority: number;
   evidenceIds: string[];
+  // Optional for saved results from earlier versions. New analyses store an array.
+  assumptions?: string[];
   status: string;
   createdAt: string;
   updatedAt?: string;
@@ -48,6 +50,11 @@ export type Action = {
   restoredAt?: string;
 }
 
+export type AnalysisSource = Pick<Evidence, 'id' | 'title' | 'kind' | 'extractedText' | 'visibility'>;
+
+export type Fact = { statement: string; evidenceIds: [string, ...string[]] };
+export type Hypothesis = { statement: string; why: string; evidenceIds: string[]; assumptions?: string[] };
+
 export type Analysis = {
   revision: number;
   inputRevision: number;
@@ -56,10 +63,13 @@ export type Analysis = {
   overview: string;
   flow: { moment: string; summary: string; evidenceIds: string[] }[];
   events: EventRecord[];
-  facts: { statement: string; evidenceIds: string[] }[];
-  hypotheses: { statement: string; why: string; evidenceIds: string[] }[];
+  facts: Fact[];
+  hypotheses: Hypothesis[];
   unknowns: { question: string; why: string; evidenceIds: string[] }[];
   actions: Action[];
+  // App-owned snapshots of the fixed sources actually used in this analysis.
+  sources?: AnalysisSource[];
+  grounding?: { includeRoleProfile: boolean; previousContextMayIncludeRoleProfile?: boolean; evidenceIds: string[] };
   usage?: { input_tokens?: number; output_tokens?: number } | null;
 };
 

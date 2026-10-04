@@ -157,6 +157,9 @@ button:disabled { cursor: default; opacity: .62; }
 .signal-item { padding-top: 10px; margin-top: 8px; border-top: 1px solid #f0eee7; }
 .signal-item p { margin: 0 0 6px; color: #465a4f; font-size: 10px; line-height: 1.65; }
 .signal-item small { display: block; margin-bottom: 6px; color: #8a948d; line-height: 1.55; font-size: 9px; }
+.assumption-note { margin: 7px 0; padding: 6px 8px; border-left: 2px solid #b49b69; background: #f6f2e8; font-size: 10px; line-height: 1.6; }
+.assumption-note > span { display: block; color: #8b713f; font-size: 9px; font-weight: 700; }
+.assumption-note p { margin: 2px 0 0; color: #655b49; overflow-wrap: anywhere; }
 .signal-empty { margin: 12px 0 0; color: #9ba49d; font-size: 9px; line-height: 1.65; }
 .citations { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .citation-chip { border: 1px solid #e4e8df; border-radius: 12px; padding: 3px 7px; background: #f7f9f3; color: #668071; font-size: 8px; white-space: nowrap; }

@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { synopsisText } = require('../shared/analysisSources.cjs');
 
 const MAX_CODEX_IMAGE_BYTES = 40 * 1024 * 1024;
 const MAX_CODEX_TEXT_CHARACTERS = 300000;
@@ -39,7 +40,7 @@ async function prepareCodexInput(caseRecord, requestData, options = {}) {
     }
     input.push({ type: 'text', text });
   };
-  addText('[シナリオ概要]\n' + (caseRecord.synopsis || '概要未入力'));
+  addText(synopsisText(caseRecord));
   const checkCancelled = () => {
     if (!signal || !signal.aborted) return;
     const error = new Error('Codex解析をキャンセルしました。');

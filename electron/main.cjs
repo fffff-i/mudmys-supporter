@@ -6,6 +6,7 @@ const { execFileSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const OpenAI = require('openai').default;
 const { applyAnalysis, discardAction, restoreAction } = require('../shared/analysisLifecycle.cjs');
+const { synopsisText, roleText, unconfirmedAssumptionsText } = require('../shared/analysisSources.cjs');
 const { getCaseDir } = require('../shared/storage.cjs');
 const { createSerialLock } = require('../shared/serialLock.cjs');
 const { CodexAppServerClient, CodexAppServerError, buildCodexEnvironment } = require('./codexAppServer.cjs');
@@ -39,10 +40,10 @@ const ANALYSIS_SCHEMA = {
     overview: { type: 'string' },
     flow: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['moment', 'summary', 'evidenceIds'], properties: { moment: { type: 'string' }, summary: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
     events: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['timeText', 'people', 'what', 'type', 'sourceId', 'page', 'quote', 'ambiguity'], properties: { timeText: { type: 'string' }, people: { type: 'array', items: { type: 'string' } }, what: { type: 'string' }, type: { type: 'string', enum: ['observed', 'reported', 'statement', 'recorded', 'inference', 'unknown'] }, sourceId: { type: 'string' }, page: { type: 'string' }, quote: { type: 'string' }, ambiguity: { type: 'string' } } } },
-    facts: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'evidenceIds'], properties: { statement: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
-    hypotheses: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'why', 'evidenceIds'], properties: { statement: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
+    facts: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'evidenceIds'], properties: { statement: { type: 'string' }, evidenceIds: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 }, description: '今回送信された実在する出典。事実は出典を1件以上必要とする。' } } } },
+    hypotheses: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['statement', 'why', 'evidenceIds', 'assumptions'], properties: { statement: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '想定した未公開情報など、未確認の条件。条件がなければ空配列。' } } } },
     unknowns: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['question', 'why', 'evidenceIds'], properties: { question: { type: 'string' }, why: { type: 'string' }, evidenceIds: { type: 'array', items: { type: 'string' } } } } },
-    actions: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['title', 'who', 'step', 'suggestedLine', 'purpose', 'secretRisk', 'rationale', 'priority', 'evidenceIds', 'continuesActionIds', 'replacesActionIds'], properties: { title: { type: 'string' }, who: { type: 'string' }, step: { type: 'string' }, suggestedLine: { type: 'string' }, purpose: { type: 'string' }, secretRisk: { type: 'string' }, rationale: { type: 'string' }, priority: { type: 'integer' }, evidenceIds: { type: 'array', items: { type: 'string' } }, continuesActionIds: { type: 'array', items: { type: 'string' } }, replacesActionIds: { type: 'array', items: { type: 'string' } } } } },
+    actions: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['title', 'who', 'step', 'suggestedLine', 'purpose', 'secretRisk', 'rationale', 'priority', 'evidenceIds', 'assumptions', 'continuesActionIds', 'replacesActionIds'], properties: { title: { type: 'string' }, who: { type: 'string' }, step: { type: 'string' }, suggestedLine: { type: 'string' }, purpose: { type: 'string' }, secretRisk: { type: 'string' }, rationale: { type: 'string' }, priority: { type: 'integer' }, evidenceIds: { type: 'array', items: { type: 'string' }, description: '出典は任意。なければ空配列。存在しないIDは使わない。' }, assumptions: { type: 'array', items: { type: 'string', minLength: 1 }, description: '行動が依存する未確認の条件。単なる確認行動には条件を作らず空配列にする。' }, continuesActionIds: { type: 'array', items: { type: 'string' } }, replacesActionIds: { type: 'array', items: { type: 'string' } } } } },
     retirements: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['actionId', 'reason'], properties: { actionId: { type: 'string' }, reason: { type: 'string' } } } }
   }
 };
@@ -54,9 +55,11 @@ const SYSTEM_PROMPT = [
   '直接資料に書かれた/見える内容を事実、読み取りや解釈を仮説、まだ決められない点を未確認事項に分けます。確率や犯人らしさの数値は出しません。公開範囲（全体公開・自分だけ・不明）は、事実/仮説/未確認と別の情報として扱います。',
   'イベント列では、元の資料の粒度を保って時刻表現、誰が/誰と、何があった/何を話したかを記録します。原文の時間表現をそのまま残し、「8時前」「夕方」「その後」等を勝手に正規化しない。同じ人物か不明な呼称を統合しない。主語省略、伝聞と直接観察、否定、期間や順序の曖昧さを勝手に補わない。各イベントに資料ID、ページ番号（不明なら空文字）、短い原文引用、曖昧な点を入れます。叙述トリックと断定せず「確認が必要な曖昧点」として扱います。',
   '証言の存在と証言内容の真偽を分けます。例「Xが20時にAにいたと発言した」は発言としての事実ですが、「Xが20時にAにいた」は独立した裏付けがない限り事実ではありません。事実欄には「Xがそう発言した」と記し、発言内容そのものは仮説/未確認のままにします。',
-  'ユーザーが自分の役・目的を入力していれば、その目的達成に役立つ行動を優先します。未入力なら、役柄や目的を推測せず、必要なら確認を促します。秘密を不用意に開示しないよう、行動ごとに秘密が漏れるリスクを短く示します。',
-  '各方針は次に取る具体的行動の順番です。誰へ何を聞く/発言するか、質問または短い発言例、目的への寄与、根拠資料IDを含めます。資料にない人物名を作らないでください。',
-  '根拠IDは今回渡された資料IDを一字一句そのまま使ってください。根拠資料のない事実・仮説・行動を作らず、資料IDを推測しません。',
+  '送信されたHO（ハンドアウト）に役・目的が書かれていれば読み取って利用し、別欄への再入力を前提にしません。役プロフィールは任意の補足です。どちらにもなければ役柄や目的を決めつけず、一般的な確認行動を提案します。秘密を不用意に開示しないよう、行動ごとに秘密が漏れるリスクを短く示します。',
+  '各方針は次に取る具体的行動の順番です。誰へ何を聞く/発言するか、質問または短い発言例、目的への寄与を含めます。未公開の鍵・別の出入口・協力者などを一般的な可能性として想定できますが、資料にない人物名を登場人物として作らず「鍵の管理者」「協力者がいるなら」等と表現します。',
+  '事実のevidenceIdsには今回送信された実在する出典IDを1件以上必ず入れます。仮説・行動のevidenceIdsは任意で、根拠がなければ空配列にします。参照するIDは資料IDを一字一句そのまま使い、推測しません。概要・役プロフィールは資料IDが付いて送信された場合だけその固定出典IDを使えます。未入力・送信対象外のプロフィールは参照できません。',
+  '仮説・行動で未公開情報の存在を想定する場合、assumptionsに未確認の条件を短く記録し、本文も「別の出入口があるなら」のように条件付きにします。条件がなければ空配列にし、単なる確認行動に前提を無理に付けません。利用者に分類・根拠登録・前提の手入力や確認操作を求めません。',
+  '次回更新でも前回の仮説・行動のassumptionsは未確認の条件です。新資料に直接の裏付けがあるか見直し、確認されない条件は保持します。事実へ移すには、その条件を直接裏付ける今回の実在する出典が必要です。以前のAI出力や提案の繰り返し、関連資料のIDが付いているだけでは裏付けになりません。資料にないシナリオの正解を事実として補完しません。',
   '現在の有効方針のIDはローカルアプリが管理します。継続する方針は continuesActionIds、新しい案に置き換える方針は replacesActionIds に置き、不要な方針は retirements に理由を付けます。各既存方針IDはこのいずれかにちょうど1回だけ含めてください。手動で棄却された方針は再提案しません。',
   '出力は指定JSONスキーマに従ってください。',
 ].join('\n');
@@ -373,12 +376,6 @@ function currentActionsText(caseRecord) {
   return '\n\n[アプリが保持する現在の方針状態。資料としての根拠ではありません]\n有効方針: ' + JSON.stringify(current.map((a) => ({ id: a.id, title: a.title, step: a.step, priority: a.priority }))) + '\n手動棄却済み(再提案しない): ' + JSON.stringify(rejected.map((a) => ({ title: a.title }))) + '\n';
 }
 
-function roleText(caseRecord, includeRoleProfile) {
-  if (!includeRoleProfile) return '[役・目的・秘密: 今回の解析には含めない]';
-  const role = caseRecord.roleProfile || {};
-  return '[プレイヤー自身の役・目的・秘密。資料の公開範囲とは別の情報です]\n役: ' + (role.role || '未入力') + '\n目的: ' + (role.goal || '未入力') + '\n秘密: ' + (role.secret || '未入力');
-}
-
 function renderEvidenceLabel(item) {
   const visibility = item.visibility === 'shared' ? '全体公開' : item.visibility === 'private' ? '自分だけ' : '公開状況不明';
   return '[資料ID: ' + item.id + '] [' + visibility + '] [' + (item.kind === 'image' ? '画像' : item.kind === 'pdf' ? 'PDF' : 'テキスト') + '] ' + item.title;
@@ -391,8 +388,8 @@ async function openAiRequest(caseRecord, preferences, requestData) {
   const key = safeStorage.decryptString(encrypted);
   if (!key.trim()) throw new Error('OpenAI APIキーを設定してください。');
   const client = new OpenAI({ apiKey: key, timeout: 180000, maxRetries: 0 });
-  const instructions = SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord);
-  const content = [{ type: 'input_text', text: '[シナリオ概要]\n' + (caseRecord.synopsis || '概要未入力') }];
+  const instructions = SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile);
+  const content = [{ type: 'input_text', text: synopsisText(caseRecord) }];
   for (const { item, bytes, text } of requestData.rows) {
     content.push({ type: 'input_text', text: renderEvidenceLabel(item) });
     if (item.kind === 'pdf') {
@@ -425,8 +422,8 @@ async function openAiRequest(caseRecord, preferences, requestData) {
 async function ollamaRequest(caseRecord, preferences, requestData) {
   const endpoint = normalizeOllamaUrl(preferences.ollamaUrl);
   if (!preferences.ollamaModel || !preferences.ollamaModel.trim()) throw new Error('Ollamaモデル名を設定してください。');
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord) }];
-  let userText = '[シナリオ概要]\n' + (caseRecord.synopsis || '概要未入力');
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT + '\n\n' + roleText(caseRecord, preferences.includeRoleProfile) + currentActionsText(caseRecord) + unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile) }];
+  let userText = synopsisText(caseRecord);
   const images = [];
   for (const { item, bytes, text } of requestData.rows) {
     userText += '\n\n' + renderEvidenceLabel(item) + '\n';
@@ -472,7 +469,7 @@ async function codexRequest(caseRecord, preferences, requestData, signal) {
     try {
       prepared = await prepareCodexInput(caseRecord, requestData, {
         signal,
-        contextText: [roleText(caseRecord, preferences.includeRoleProfile), currentActionsText(caseRecord)].join('\n\n')
+        contextText: [roleText(caseRecord, preferences.includeRoleProfile), currentActionsText(caseRecord), unconfirmedAssumptionsText(caseRecord, preferences.includeRoleProfile)].join('\n\n')
       });
       const instructions = buildCodexDeveloperInstructions(SYSTEM_PROMPT);
       const result = await client.runStructuredTurn({
@@ -522,7 +519,10 @@ async function analyzeCase(id, expectedRevision) {
       const latest = await readCase(id);
       if (latest.revision !== expectedRevision) return { status: 'stale', message: '解析中にシナリオが更新されたため、古い結果は保存しませんでした。' };
       const output = response.output;
-      const updated = applyAnalysis(latest, output, expectedRevision);
+      const updated = applyAnalysis(latest, output, expectedRevision, new Date().toISOString(), {
+        includeRoleProfile: preferences.includeRoleProfile === true,
+        evidenceIds: requestData.rows.map(({ item }) => item.id)
+      });
       updated.analysis.usage = response.usage;
       updated.analysis.provider = output.provider;
       await writeCase(updated);
