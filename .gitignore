@@ -5,6 +5,7 @@ release-*/
 qa/
 docs/
 .local/
+handoff.md
 .codex/
 codex-profile/
 userData/

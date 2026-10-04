@@ -22,9 +22,10 @@
 ## 開発環境
 
 Node.js 22.13以降とnpmが必要です（Viteは20.19以降または22.12以降、PDF.jsが22.13以降を要求します）。
+開発・CIの標準はNode.js 24で、`.nvmrc` に指定しています。
 
 ```powershell
-npm install
+npm ci
 npm run dev
 ```
 
@@ -34,6 +35,10 @@ npm run dev
 npm test
 npm run build
 ```
+
+CIと同じ単体テスト・型検査・ビルド・6種類のヘッドレス画面検証をまとめて実行するには `npm run check` を使います。画面検証だけを再実行する場合は、ビルド後に `npm run test:ui` を使えます。
+
+Git管理は `main` を唯一の長期ブランチとするTrunk-Based Developmentです。短命ブランチからPRを作り、必須CI `Verify` の成功後にsquash mergeします。作業開始・統合・リリースとGit設定の手順は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
 
 シナリオ切替と保存中の下書きを画面から検証するには、ビルド後に `node scripts/verifyScenarioDrafts.cjs` を実行します。Edge / Chrome / Chromiumをヘッドレスで使い、架空シナリオ、ブラウザーの一時profile、結果をこのコピーの `.local/scenario-drafts-ui/` に保存します。Electronや実際のAI送信は使いません。ブラウザーが標準位置にない場合は環境変数 `MAKUA_HEADLESS_BROWSER` に実行ファイルのパスを指定できます。
 
