@@ -18,7 +18,7 @@ npm ci
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setupTrunk.ps1
 ```
 
-このスクリプトは、このクローンだけに `pull.ff=only`、`merge.ff=only`、`fetch.prune=true`、`push.default=simple`、`push.autoSetupRemote=true` を設定します。グローバル設定は変更しません。`ExecutionPolicy Bypass` はこのPowerShellプロセスだけに適用し、Windowsの実行ポリシーを変更しません。共用・junctionの `node_modules` を使う作業コピーでは依存関係を再インストールせず、専用のクローンで `npm ci` します。
+このスクリプトは、このクローンだけに `pull.ff=only`、`merge.ff=only`、`fetch.prune=true`、`push.default=simple`、`push.autoSetupRemote=true` を設定します。グローバル設定は変更しません。`ExecutionPolicy Bypass` はこのPowerShellプロセスだけに適用し、Windowsの実行ポリシーを変更しません。
 
 ## 日々の開発
 
@@ -30,11 +30,13 @@ git pull --ff-only origin main
 git switch -c codex/describe-the-change
 ```
 
-実装後は `npm run check` で単体テスト、型検査、ビルド、6種類のヘッドレス画面検証を実行します。画面検証にはEdge / Chrome / Chromiumが必要です。標準位置にない場合は `MAKUA_HEADLESS_BROWSER` に実行ファイルのパスを指定します。検証結果はGit対象外の `.local/` に保存されます。
+実装後は、後述の検証を実行し、変更したファイルを明示してstageします。commit・push前にファイル一覧と差分を確認します。
 
 ```powershell
 npm run check
 git add <変更したファイル>
+git diff --cached --name-only
+git diff --cached
 git commit -m "変更の目的を説明する"
 git push -u origin codex/describe-the-change
 ```
@@ -49,7 +51,41 @@ git pull --ff-only origin main
 git fetch --prune origin
 ```
 
-PRの統合済み状態と未保存の作業がないことを確認し、ローカルの作業ブランチを削除します。squash mergeはコミットIDが変わるため、この確認後に `git branch -D codex/describe-the-change` を使います。mainへの直接pushは通常の開発では使いません。
+PRの統合済み状態と未保存の作業がないことを確認し、ローカルの作業ブランチを削除します。squash mergeはコミットIDが変わるため、この確認後に `git branch -D codex/describe-the-change` を使います。mainへの直接pushは使いません。
+
+## 検証
+
+`npm run check` は単体テスト、型検査、ビルド、6種類のヘッドレス画面検証を順に実行します。画面検証にはEdge / Chrome / Chromiumが必要です。標準位置にない場合は `MAKUA_HEADLESS_BROWSER` に実行ファイルのパスを指定します。画面検証だけを再実行する場合は、ビルド後に `npm run test:ui` を使います。
+
+個別の画面検証は、ビルド後に次のスクリプトを実行します。各スクリプトは架空データ、モック、固有のブラウザープロファイルを使い、実際のAI送信やユーザーデータを検証に使いません。
+
+| コマンド | 検証する動作 | 結果の保存先 |
+| --- | --- | --- |
+| `node scripts/verifyScenarioDrafts.cjs` | シナリオ切替、保存中の下書きと追加入力 | `.local/scenario-drafts-ui/` |
+| `node scripts/verifyPdfSources.cjs` | PDF原本、ページ別出典、旧データ、失敗・遅延応答 | `.local/pdf-sources-ui/` |
+| `node scripts/verifyActionHistory.cjs` | 1クリック完了・見送り、任意メモ、切替中の保存 | `.local/action-history-ui/` |
+| `node scripts/verifyEvidenceIntake.cjs` | 一括追加、Ctrl+Enter・IME、編集、除外・復帰 | `.local/evidence-intake-ui/` |
+| `node scripts/verifyAnalysisUpdates.cjs` | 解析中の保存、更新集約、取消、古い応答の排除 | `.local/analysis-update-ui/` |
+| `node scripts/verifyPlayScreen.cjs` | 主画面での追加、全件展開、保存時の出典、画面配置 | `.local/play-screen-ui/` |
+
+結果JSON・画像・ブラウザープロファイルなどの生成物はGit対象外です。
+
+## 公開文書とローカル情報
+
+Git上の文書は、各クローンで共通のプロジェクト情報に限定します。
+
+| 文書 | 役割 |
+| --- | --- |
+| [README.md](README.md) | アプリの機能、利用方法、AIへの送信範囲と保存の仕様 |
+| [AGENTS.md](AGENTS.md) | coding agentが守るプロジェクト共通の規則 |
+| CONTRIBUTING.md | 開発環境、検証、Git・並行開発・リリースの手順 |
+| [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) | 変更後の動作と検証結果を確認するPR様式 |
+
+PC固有の操作制約、個人の絶対パス、タスクの引き継ぎ、会話履歴、調査ログ、実資料、認証情報はGit管理外で扱います。作業記録は `.local/` に保存できます。プロジェクト固有のローカル指示には、Git対象外のルート `AGENTS.override.md` を使えます。個人の共通指示は、Git管理外のCodexホームの `AGENTS.md` で管理できます。
+
+Codexは同じディレクトリでは `AGENTS.override.md` を `AGENTS.md` より優先し、両方を自動結合しません。ローカルoverrideの冒頭には、公開 `AGENTS.md` を先に読んで共通規則を適用する指示を記載してください。未追跡のローカル指示は新しいworktreeへ自動的には引き継がれないため、必要なworktreeに個別に配置します。[公式の読み込み順序](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
+
+ローカル情報を公開文書・PR本文・コミットメッセージ・コメントへ転記しないよう、commit・push前に確認します。CIとPRレビューはpush後に動くため、公開前の確認を代替しません。`.gitignore`への追加やファイルの削除だけでは、公開済みのコミット・PRから内容は消えません。
 
 ## Codexへ並行開発を委託する場合
 

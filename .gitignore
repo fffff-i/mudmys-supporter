@@ -6,6 +6,7 @@ qa/
 docs/
 .local/
 handoff.md
+/AGENTS.override.md
 .codex/
 codex-profile/
 userData/
