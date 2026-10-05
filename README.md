@@ -21,34 +21,14 @@
 
 ## 開発環境
 
-Node.js 22.13以降とnpmが必要です（Viteは20.19以降または22.12以降、PDF.jsが22.13以降を要求します）。
-開発・CIの標準はNode.js 24で、`.nvmrc` に指定しています。
+開発・CIの標準はNode.js 24とnpmです。Node.jsのバージョンは `.nvmrc` に指定しています。
 
 ```powershell
 npm ci
 npm run dev
 ```
 
-確認には次を実行します。
-
-```powershell
-npm test
-npm run build
-```
-
-CIと同じ単体テスト・型検査・ビルド・6種類のヘッドレス画面検証をまとめて実行するには `npm run check` を使います。画面検証だけを再実行する場合は、ビルド後に `npm run test:ui` を使えます。
-
-Git管理は `main` を唯一の長期ブランチとするTrunk-Based Developmentです。短命ブランチからPRを作り、必須CI `Verify` の成功後にsquash mergeします。作業開始・統合・リリースとGit設定の手順は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
-
-シナリオ切替と保存中の下書きを画面から検証するには、ビルド後に `node scripts/verifyScenarioDrafts.cjs` を実行します。Edge / Chrome / Chromiumをヘッドレスで使い、架空シナリオ、ブラウザーの一時profile、結果をこのコピーの `.local/scenario-drafts-ui/` に保存します。Electronや実際のAI送信は使いません。ブラウザーが標準位置にない場合は環境変数 `MAKUA_HEADLESS_BROWSER` に実行ファイルのパスを指定できます。
-
-PDF原本表示と出典を画面から検証するには、ビルド後に `node scripts/verifyPdfSources.cjs` を実行します。同じヘッドレス方式で文字・画像・混在ページ、旧データ、読み取り失敗、表示上限、遅延応答、保存当時の出典を検証し、架空データと結果を `.local/pdf-sources-ui/` に保存します。
-
-行動の1クリック保存、任意メモ、保存中のシナリオ切替と追加入力は、ビルド後に `node scripts/verifyActionHistory.cjs` でヘッドレス検証できます。架空データと固有のブラウザープロファイルだけを使い、結果はこのコピーの `.local/action-history-ui/results.json` に保存します。
-
-資料の一括追加、Ctrl+Enter・IME、画像読込や保存中のシナリオ切替、失敗後の再追加、本文編集、除外・復帰は、ビルド後に `node scripts/verifyEvidenceIntake.cjs` で検証できます。実クリップボードやOSダイアログは使わず、候補と入力イベントをモック化し、結果は `.local/evidence-intake-ui/results.json` に保存します。
-
-解析中の保存、更新の集約、取消、設定変更と古い応答は `node scripts/verifyAnalysisUpdates.cjs`、主画面での追加、全件展開、旧記述と保存時の出典、1100×720/1420×920の配置は `node scripts/verifyPlayScreen.cjs` で検証できます。前者の結果は `.local/analysis-update-ui/results.json`、後者の結果と画像は `.local/play-screen-ui/` に保存します。どちらも固有のヘッドレス環境・架空データ・モックを使います。
+単体テスト・型検査・ビルド・画面検証は `npm run check` でまとめて実行できます。検証スクリプト、Issueごとのworktree、PR・CI・main保護、リリースの手順は [CONTRIBUTING.md](CONTRIBUTING.md) にまとめています。Git管理は `main` を唯一の長期ブランチとするTrunk-Based Developmentです。
 
 Windows向けportable版を生成するには `npm run package:portable` を実行します。生成物は `release-v0.3.0/` に出力されます。このフォルダーは公開リポジトリには含めません。
 
@@ -57,7 +37,7 @@ Windows向けportable版を生成するには `npm run package:portable` を実�
 AIは初期状態では未接続です。未接続でも資料の保存、整理、シナリオごとのバックアップを利用できます。設定から次の接続先を選べます。
 
 - **OpenAI API:** APIキーをWindowsの暗号化ストレージに保存し、同意した資料をAPIへ送信します。ChatGPT/Codexの契約とは別のAPI利用料がかかる場合があります。
-- **Ollama:** このPCのlocalhost上のOllamaへ接続します。画像の読解可否は選んだモデルによって異なります。PDFページ画像は送信せず、抽出できたテキストを使います。
+- **Ollama:** ローカルのOllama（localhost）へ接続します。画像の読解可否は選んだモデルによって異なります。PDFページ画像は送信せず、抽出できたテキストを使います。
 - **Codex（ChatGPTの契約枠）:** 公式Codex CLIのApp Serverを使う実験的な接続です。設定画面から専用profileへのChatGPTサインインを開始し、表示されたデバイスコードを利用者自身が公式認証ページで入力します。アプリはブラウザーを開かず、通常のCodex認証情報をコピーしません。Platform APIへフォールバックしません。
 
 OpenAI APIとCodexでは、シナリオ概要、資料全文、画像、PDF、送信を許可した方針・仮説・行動履歴（完了・見送り・更新、任意メモ）を選択した接続先へ送信します。「自分の役・目的・秘密を解析に含める」がOFFの場合、役プロフィールと、役情報を使った解析に由来する過去の文章を除外します。由来を確認できない旧データも除外します。AIが後から付けた退役理由と任意メモも由来を保持し、役情報を含む履歴は送信しません。履歴メモと以前のAI出力自体は事実の出典にはしません。この扱いはOllamaにも共通です。以前の整理結果と方針はローカルの履歴で閲覧できます。同じ役情報を含むHOを資料として追加した場合は、HOを含む資料の送信設定に従います。利用前に設定画面の送信範囲を確認してください。自動更新は個別の同意が必要です。
